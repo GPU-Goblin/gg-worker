@@ -1,0 +1,8 @@
+/target
+**/target
+/var/
+*.log
+.DS_Store
+# A worker's key and configuration never belong in the repository.
+*.key
+/worker.toml

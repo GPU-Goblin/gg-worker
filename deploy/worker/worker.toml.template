@@ -1,0 +1,55 @@
+# GPU Goblin worker configuration, written by install.sh to ~/.config/gpu-goblin/worker.toml.
+# Edit it freely: local policy always wins over anything the server asks. After a change:
+#   gg-worker --config ~/.config/gpu-goblin/worker.toml doctor && systemctl --user restart gg-worker
+# install.sh replaces the @...@ markers; it never overwrites an existing worker.toml.
+
+server_url = "@SERVER_URL@"                     # https only (public mode refuses plain http)
+key_path = "@DATA_DIR@/worker.key"             # your worker identity (0600); keep it private
+work_dir = "@DATA_DIR@/work"
+display_name = "@DISPLAY_NAME@"                # shown on your contributor page; no personal data needed
+enrollment_token = "@ENROLLMENT_TOKEN@"        # attaches this machine to your account (keep this file private)
+engine = "@ENGINE@"                            # cpu | gpu | gpu:<index> | cuda | cuda:<index>; never falls back to cpu
+# cuda only (install.sh --cuda sets it): the LibTorch libraries, bound read-only in the sandbox.
+# libtorch_dir = "/home/you/.local/lib/gpu-goblin/libtorch/<digest>/libtorch/lib"
+# GPU only: memory the executor may use on the card, in bytes, with a margin below its size
+# (for example 12000000000 on a 16 GB card). Without it, the server offers no task that needs it.
+# device_memory_bytes = 12000000000
+kinds = ["tensor.matmul.v1", "mlp.train.v1", "mlp.grad.v1", "graph.grad.v1", "graph.stage.v1"]
+concurrency = 1
+
+# What you lend. The executor is confined to these limits (cgroups) on top of the sandbox.
+max_ram_bytes = 4294967296                     # 4 GiB
+max_disk_bytes = 21474836480                   # 20 GiB of task bundles
+max_download_bytes = 2147483648                # largest single input accepted
+cache_max_bytes = 4294967296                   # artifact cache, re-hashed on every hit
+kernel_cache_max_bytes = 1073741824            # compiled GPU kernels kept between tasks, 0 disables
+cpu_quota_percent = 0                          # 0 = no limit; 200 = two cores at most
+claim_wait_secs = 20
+heartbeat_secs = 30
+keep_failed_bundles = false
+
+# Protections. public = true refuses to start unless every sandbox protection holds (bubblewrap
+# namespaces without network, Landlock, seccomp, rlimits) and refuses any development shortcut.
+public = true
+sandbox = "bwrap"
+dev_unsafe_no_isolation = false
+# require: refuse to run tasks without cgroup limits (systemd user delegation; see the install
+# guide). Set "auto" only if your system cannot delegate cgroups and you accept rlimits alone.
+cgroups = "require"
+
+# Peer-to-peer sharing of task inputs (ADR-0012), ON for this beta: it spares the server's bandwidth.
+# While it is on, your public ip:port is visible to the other workers authorized on the same
+# artifact, and your machine serves them verified chunks of data it already holds (bounded below).
+# Turn it off with enabled = false (or only stop serving with share = false).
+[p2p]
+enabled = true
+share = true
+listen_addr = "[::]:0"                         # a fixed port (for example "[::]:7843") eases forwarding
+advertise_addr = ""                            # "ip:port" if you forwarded a port by hand
+max_upload_conns = 4
+upload_budget_bytes = 8589934592               # 8 GiB served to peers per run, then refuse
+max_peers = 8
+allow_private_peers = false                    # refused in public mode
+ipv6 = true
+nat_pmp = true                                 # ask the router for a port mapping (removed on stop)
+upnp = true

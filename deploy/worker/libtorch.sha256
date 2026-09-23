@@ -1,0 +1,8 @@
+# LibTorch for the native CUDA engine (ADR-0033, ADR-0039), in sha256sum format. install.sh --cuda
+# downloads the official archive from the url below and refuses it unless it has exactly this size and
+# digest; this file is covered by the release signature. The archive is not redistributed.
+# Pinned on 2026-09-25 from the official download; cross-checked against the server's S3 ETag
+# (96411cd9395d733fea98bea5bbfd0b8e-39, MD5 of 39 parts of 100 MB each, recomputed from the file).
+# url: https://download.pytorch.org/libtorch/cu128/libtorch-shared-with-deps-2.9.0%2Bcu128.zip
+# size: 3888597232
+75555f77884f149d537494da6953a3626cea68996b07fb711e4a83d4f48b4fdb  libtorch-shared-with-deps-2.9.0+cu128.zip

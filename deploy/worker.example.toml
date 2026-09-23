@@ -1,0 +1,54 @@
+# gg-worker configuration. Local policy always wins over server instructions.
+server_url = "http://127.0.0.1:8080"
+key_path = "./var/worker/worker.key"     # Ed25519 key, created by `gg-worker init` (0600)
+work_dir = "./var/worker/work"
+display_name = "my-worker"
+enrollment_token = ""                    # gge_… from the contributor portal: attaches this machine to your account
+engine = "cpu"                           # cpu | gpu | gpu:<index> | cuda | cuda:<index>; never falls back to cpu
+# libtorch_dir = "/opt/libtorch/lib"     # engine "cuda" (NVIDIA, ADR-0033): LibTorch 2.9.0 cu128 libraries
+kinds = ["tensor.matmul.v1"]
+concurrency = 1
+max_ram_bytes = 4294967296
+max_disk_bytes = 21474836480
+max_download_bytes = 2147483648
+cache_max_bytes = 4294967296            # local artifact cache (re-hashed on every hit), 0 disables
+kernel_cache_max_bytes = 1073741824     # compiled GPU kernels kept between tasks (ADR-0032), 0 disables
+persistent_executor = true              # GPU engines: one sandboxed executor per training run (ADR-0034)
+executor_session_max_tasks = 200        # a session is replaced after this many tasks
+claim_wait_secs = 20
+heartbeat_secs = 30
+keep_failed_bundles = false
+# Sandbox: "bwrap" runs the executor in bubblewrap (user/mount/pid/net namespaces, no network,
+# read-only system) and the executor restricts itself with Landlock, seccomp and rlimits.
+# "none" runs it unconfined and requires dev_unsafe_no_isolation = true (development only).
+sandbox = "bwrap"
+cgroups = "auto"                         # auto | require | off — systemd-run --user scopes (MemoryMax, TasksMax, CPUQuota)
+cpu_quota_percent = 0                    # 0 = no CPU quota; 100 = one core
+dev_unsafe_no_isolation = false
+public = false
+
+[dev_faults]                             # local fault injection for demonstrations only
+replay_submission = false
+corrupt_outputs = false
+
+# Peer-assisted artifact distribution (ADR-0012). Off by default: nothing is fetched from peers and
+# nothing is served until you turn it on. Chunks are always verified against the manifest signed by
+# the control plane, which stays the durable source.
+[p2p]
+enabled = false
+share = true                             # serve cached artifacts to readers holding a server ticket
+listen_addr = "[::]:0"                   # IPv6 and, on a usual Linux, IPv4; IPv4 fallback without IPv6
+advertise_addr = ""                      # announced ip:port; empty = the bound address
+max_upload_conns = 4
+upload_budget_bytes = 8589934592         # total bytes served to peers before refusing
+max_peers = 8
+allow_private_peers = false              # contact loopback/private peers; refused when public = true
+request_timeout_secs = 20
+# NAT traversal (ADR-0013): asks the gateway for a port mapping (RFC 6886); on failure, the worker
+# announces the address the control plane observes. The server checks reachability before
+# announcing the address to other workers.
+ipv6 = true                              # announce a global IPv6 address if one exists (no NAT to traverse)
+nat_pmp = true                           # RFC 6886 (many routers do not answer it)
+upnp = true                              # UPnP-IGD, tried next; measured working on a home router
+nat_pmp_lifetime_secs = 3600             # requested lease (both mechanisms), renewed at half-life
+nat_pmp_gateway = ""                     # "" = default IPv4 gateway on port 5351

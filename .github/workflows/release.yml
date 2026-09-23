@@ -1,0 +1,70 @@
+name: Release gate
+
+# The signed release of the worker binaries is PUBLISHED BY GPU-Goblin/gg-server (its release
+# workflow builds gg-worker from this repository at the same tag, under one manifest and one offline
+# signature per version). This repository has no release tooling of its own (no xtask).
+#
+# What happens here on a tag vX.Y.Z: the tagged code is checked (fmt, clippy, tests, sandbox tests,
+# GPU variant compiled on the same runner image as the release build), and a DRAFT release is
+# created that only points to the signed binaries on gg-server's release page. No binary is attached
+# here: a contributor must never find unsigned executables next to the source.
+#
+# Order for the owner: tag gg-worker (this workflow must pass), then tag gg-server with the same
+# version (its workflow checks out this tag and builds the release).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create the draft release only
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_STRIP: debuginfo
+
+jobs:
+  gate:
+    name: check ${{ github.ref_name }}
+    # Same image as gg-server's release build (glibc 2.35: binaries run on Debian 12).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (pinned by rust-toolchain.toml)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: bubblewrap (the sandbox tests require it)
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Version matches the tag
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "gg-worker") | .version')"
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME but crate version $version"; exit 1; }
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Release builds compile (CPU and GPU)
+        run: |
+          cargo build --release --bins
+          cargo build --release --bins --features gg-worker/gpu --target-dir target-gpu
+      - name: Installer scripts parse
+        run: |
+          bash -n deploy/worker/install.sh
+          shellcheck deploy/worker/install.sh
+
+      - name: Draft release pointing to the signed binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<NOTES
+          Source of the contributor agent at \`$GITHUB_SHA\`.
+
+          The signed binaries (gg-worker, gg-executor, their GPU builds) and install.sh are published
+          with the GPU Goblin release of the same version:
+          https://github.com/GPU-Goblin/gg-server/releases/tag/$GITHUB_REF_NAME
+
+          Verify before running: ssh-keygen -Y verify on SHA256SUMS, then sha256sum -c
+          (install.sh does both).
+          NOTES
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
+            --title "gg-worker $GITHUB_REF_NAME" --notes-file notes.md

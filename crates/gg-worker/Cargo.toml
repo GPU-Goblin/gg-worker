@@ -1,0 +1,55 @@
+[package]
+name = "gg-worker"
+description = "GPU Goblin contributor agent (gg-worker) and separated executor process (gg-executor)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gg-worker"
+path = "src/bin/gg-worker.rs"
+
+[[bin]]
+name = "gg-executor"
+path = "src/bin/gg-executor.rs"
+
+[features]
+default = []
+gpu = ["gg-compute/gpu"]
+# Native CUDA engine (ADR-0033): LibTorch 2.9 at build and run time (`libtorch_dir`).
+cuda = ["gg-compute/cuda"]
+
+
+[dependencies]
+gg-core = { workspace = true }
+gg-protocol = { workspace = true }
+gg-compute = { workspace = true }
+gg-client = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+libc = "0.2"
+landlock = "0.4.7"
+seccompiler = "0.5.0"
+tempfile = { workspace = true }
+axum = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+aws-lc-rs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,29 @@
+# GPU Goblin worker, as a systemd USER service (no root). install.sh puts it in
+# ~/.config/systemd/user/gg-worker.service; manage it with:
+#   systemctl --user status|restart|stop gg-worker
+#   journalctl --user -u gg-worker -f
+# To keep it running while you are logged out: loginctl enable-linger "$USER"
+[Unit]
+Description=GPU Goblin worker (gg-worker)
+Documentation=https://github.com/GPU-Goblin/gg-worker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=%h/.local/lib/gpu-goblin/current/gg-worker --config %E/gpu-goblin/worker.toml run
+# The worker stops cleanly (current task abandoned, lease released by expiry, UPnP mapping removed)
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=30s
+Environment=RUST_LOG=info
+# The executor runs in bubblewrap (its own namespaces) inside a transient cgroup scope created with
+# systemd-run --user: no further sandboxing is applied here, because namespace or seccomp options on
+# this unit would prevent bubblewrap from creating its sandbox.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target
