@@ -74,7 +74,7 @@ async fn cp_peers(State(cp): State<ControlPlane>) -> Response {
         artifact_hash: cp.hash,
         size: cp.data.len() as u64,
         chunk_size: CHUNK,
-        reader_id: WorkerId::from_u128(42),
+        reader_id: WorkerId::from_u128(42).into(),
         reader_key: *cp.reader_key,
         issued_at: now,
         expires_at: UnixMillis(now.0 + 300_000),
@@ -212,6 +212,7 @@ fn cfg() -> FetchConfig {
         partials: None,
         self_fingerprint: None,
         swarm_patience_ms: 2000,
+        tracker: "/worker".into(),
     }
 }
 
@@ -458,7 +459,7 @@ fn ticket_for(
             artifact_hash: hash,
             size,
             chunk_size: CHUNK,
-            reader_id: WorkerId::from_u128(42),
+            reader_id: WorkerId::from_u128(42).into(),
             reader_key: reader.public_key(),
             issued_at: now,
             expires_at: UnixMillis(now.0 + ttl_ms),

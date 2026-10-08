@@ -99,7 +99,28 @@ async fn main() {
                     tracing::info!("shutdown requested");
                     let _ = tx.send(true);
                 });
+                let control = (!cfg.control_listen.is_empty())
+                    .then(|| gg_worker::control::Control::new(cfg.policy_file(), &cfg.engine))
+                    .transpose()?;
+                if let Some(ctl) = &control {
+                    let token = gg_worker::control::token(&cfg.control_token_file())?;
+                    // Another worker of this machine may hold the port: this one then runs without
+                    // the API (its policy file still applies).
+                    match gg_worker::control::serve(ctl.clone(), &cfg.control_listen, token, rx.clone()).await {
+                        Ok(addr) => {
+                            let _ = std::fs::write(
+                                cfg.control_token_file().with_file_name("control.addr"),
+                                addr.to_string(),
+                            );
+                            tracing::info!(%addr, policy = %cfg.policy_file().display(), "control API for the owner's application");
+                        }
+                        Err(e) => tracing::warn!(error = %e, listen = %cfg.control_listen, "no control API"),
+                    }
+                }
                 let mut agent = Agent::new(cfg).await?;
+                if let Some(ctl) = control {
+                    agent.with_control(ctl);
+                }
                 agent.run(rx, max_tasks).await?;
                 tracing::info!(attempts = agent.processed.len(), "agent stopped");
                 Ok(())

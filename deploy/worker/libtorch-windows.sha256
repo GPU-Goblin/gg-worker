@@ -1,0 +1,9 @@
+# LibTorch for the native CUDA engine on Windows (ADR-0033, ADR-0039, ADR-0045), in sha256sum
+# format. The Windows installer (gg-desk) downloads the official archive from the url below and
+# refuses it unless it has exactly this size and digest; this file is covered by the release
+# signature. The archive is not redistributed.
+# Pinned on 2026-10-08 from the official download; cross-checked against the server's S3 ETag
+# (72034266200825bd27aae296b281bf67-30, MD5 of 30 parts of 100 MB each, recomputed from the file).
+# url: https://download.pytorch.org/libtorch/cu128/libtorch-win-shared-with-deps-2.9.0%2Bcu128.zip
+# size: 2913799572
+daca8ba2ff7a71a8a1c090d6ec5ce883353544abdafa55d56a778ab915e30acd  libtorch-win-shared-with-deps-2.9.0+cu128.zip

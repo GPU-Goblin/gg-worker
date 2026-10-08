@@ -1,6 +1,5 @@
 //! Agent loop: register, authenticate, claim, download, execute in a child process, upload, submit.
 
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use gg_compute::EngineSelection;
@@ -25,6 +24,10 @@ pub struct ClaimResponse {
     pub spec: TaskSpecV1,
     /// Inputs.
     pub inputs: Vec<NamedArtifact>,
+    /// A lab node pulls the outputs (ADR-0041): the large ones are declared and served, not
+    /// uploaded.
+    #[serde(default)]
+    pub outputs_to_node: bool,
 }
 
 /// Named artifact.
@@ -56,29 +59,6 @@ pub enum AttemptOutcome {
 }
 
 /// The agent.
-/// An address this worker could be reached at, with how it was obtained and when it must be
-/// resolved again. The control plane dials each candidate back before advertising it, so the worker
-/// simply offers them in order of preference.
-#[derive(Clone, Debug)]
-pub struct Candidate {
-    /// `ip:port` (IPv6 in brackets).
-    pub addr: String,
-    /// How it was obtained: `configured`, `ipv6`, `nat-pmp`, `upnp`, `bound` or `observed`.
-    pub how: &'static str,
-    /// When this address must be resolved again.
-    pub renew: Instant,
-}
-
-impl Candidate {
-    fn new(addr: String, how: &'static str, valid_for: Duration) -> Self {
-        Self {
-            addr,
-            how,
-            renew: Instant::now() + valid_for,
-        }
-    }
-}
-
 pub struct Agent {
     cfg: WorkerConfig,
     /// The kinds claimed: those of the configuration this engine may produce.
@@ -101,15 +81,33 @@ pub struct Agent {
     peer_server: Option<crate::p2p::PeerServer>,
     /// Address announced to the control plane and when it must be resolved again (a NAT mapping
     /// expires; an observed address can change).
-    peer_addr: tokio::sync::Mutex<Option<(String, Instant)>>,
+    reach: gg_client::reach::Reach,
     /// UPnP mapping this worker created, removed when it stops sharing.
-    upnp_mapping: tokio::sync::Mutex<Option<(crate::upnp::Gateway, u16)>>,
     /// Attempts processed (for tests and reports).
     pub processed: Vec<AttemptOutcome>,
     /// Activations declared before their durable copy (ADR-0026), waiting for the submission to be
     /// recorded before they are uploaded in the background.
     deferred: Vec<DeferredUpload>,
+    /// Outputs a lab node is to pull from this worker (ADR-0041): pinned in the cache and announced
+    /// again until the node has them or their deadline passes.
+    node_outputs: Vec<NodeOutput>,
+    /// The owner's control (ADR-0043): policy, status, immediate pause.
+    control: Option<std::sync::Arc<crate::control::Control>>,
+    /// When the credits earned were last asked for.
+    earned_at: Option<Instant>,
 }
+
+/// An output kept for the lab node that will pull it.
+struct NodeOutput {
+    hash: Sha256Digest,
+    /// Past this, the server has sent the task again: the output is no longer needed.
+    until: Instant,
+    announced: Instant,
+}
+
+/// How often an output kept for a lab node is announced again (the control plane forgets an
+/// announcement after its peer TTL, 300 s by default).
+const NODE_OUTPUT_REANNOUNCE: Duration = Duration::from_secs(120);
 
 /// What fetching one input took.
 #[derive(Default)]
@@ -188,6 +186,70 @@ impl Drop for LeaseKeeper {
 /// Send the durable copies of declared activations, after the submission is recorded. The server
 /// verifies nothing that depends on them before they arrive, and reissues the round if they never
 /// do: failures are retried, then logged.
+/// Wait for the pushes the control plane asks of this worker and do them, each on its own, with a
+/// session of its own (the main loop keeps claiming meanwhile), until `stop`.
+async fn push_loop(
+    api: Api,
+    key_path: std::path::PathBuf,
+    network: NetworkId,
+    cache: gg_client::cache::ArtifactCache,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let key = match SecretKey::load_or_generate(&key_path) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(error = %e, "push loop: no key, pushes disabled");
+            return;
+        }
+    };
+    let mut token: Option<String> = None;
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        let t = match &token {
+            Some(t) => t.clone(),
+            None => match api.login(&key, &network, "worker-login").await {
+                Ok(s) => {
+                    token = Some(s.token.clone());
+                    s.token
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "push loop: sign-in failed");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            },
+        };
+        let asked = tokio::select! {
+            r = api.get_json::<Vec<gg_client::p2p::PushRequest>>(&t, "/worker/pushes?wait_secs=10") => r,
+            _ = stop.changed() => continue,
+        };
+        match asked {
+            Ok(items) => {
+                for req in items {
+                    let cache = cache.clone();
+                    tokio::spawn(async move {
+                        match gg_client::p2p::push_artifact(&cache, &req, Duration::from_secs(20))
+                            .await
+                        {
+                            Ok(n) => {
+                                tracing::info!(hash = %req.hash, reader = %req.reader_addr, chunks = n, "pushed an output to its reader")
+                            }
+                            Err(e) => tracing::warn!(hash = %req.hash, error = %e, "push failed"),
+                        }
+                    });
+                }
+            }
+            Err(ClientError::Status { status: 401, .. }) => token = None,
+            Err(e) => {
+                tracing::debug!(error = %e, "push loop: waiting for requests failed");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
 async fn upload_deferred(
     api: Api,
     token: String,
@@ -265,8 +327,12 @@ impl Agent {
             .await?;
         tracing::info!(worker_id = %reg.worker_id, authorized = reg.authorized, key = %key.public_key(), network = %info.network_id, "registered");
         let engine = EngineSelection::parse(&cfg.engine).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let cgroups_available = cfg.sandbox_mode() == crate::sandbox::SandboxMode::Bwrap
-            && crate::doctor::cgroups_available(&cfg);
+        // The Windows sandbox always bounds memory and CPU (its Job Object).
+        let cgroups_available = match cfg.sandbox_mode() {
+            crate::sandbox::SandboxMode::Bwrap => crate::doctor::cgroups_available(&cfg),
+            crate::sandbox::SandboxMode::AppContainer => true,
+            crate::sandbox::SandboxMode::None => false,
+        };
         if cfg.cgroups == "require" && !cgroups_available {
             anyhow::bail!("cgroups = \"require\" but systemd-run user scopes are unavailable");
         }
@@ -274,7 +340,7 @@ impl Agent {
         let kernel_cache = if matches!(
             engine,
             EngineSelection::WgpuVulkan { .. } | EngineSelection::TorchCuda { .. }
-        ) && cfg.sandbox_mode() == crate::sandbox::SandboxMode::Bwrap
+        ) && cfg.sandbox_mode() != crate::sandbox::SandboxMode::None
         {
             crate::kernel_cache::prepare(
                 &cfg.work_dir,
@@ -327,6 +393,7 @@ impl Agent {
         if !left_out.is_empty() {
             tracing::info!(engine = %cfg.engine, claimed = ?kinds, left_out = ?left_out, "kinds this engine does not run are not claimed");
         }
+        let cfg_p2p = cfg.p2p.clone();
         Ok(Self {
             cfg,
             kinds,
@@ -342,10 +409,19 @@ impl Agent {
             session: tokio::sync::Mutex::new(None),
             cache,
             peer_server,
-            peer_addr: tokio::sync::Mutex::new(None),
-            upnp_mapping: tokio::sync::Mutex::new(None),
+            reach: gg_client::reach::Reach::new(gg_client::reach::ReachConfig {
+                advertise_addr: cfg_p2p.advertise_addr,
+                ipv6: cfg_p2p.ipv6,
+                nat_pmp: cfg_p2p.nat_pmp,
+                upnp: cfg_p2p.upnp,
+                gateway: cfg_p2p.nat_pmp_gateway,
+                lease_secs: cfg_p2p.nat_pmp_lifetime_secs,
+            }),
             processed: Vec::new(),
             deferred: Vec::new(),
+            node_outputs: Vec::new(),
+            control: None,
+            earned_at: None,
         })
     }
 
@@ -424,6 +500,78 @@ impl Agent {
         }
     }
 
+    /// Let the owner control this worker (ADR-0043).
+    pub fn with_control(&mut self, ctl: std::sync::Arc<crate::control::Control>) {
+        ctl.update(|s| s.worker_id = Some(self.worker_id.to_string()));
+        self.control = Some(ctl);
+    }
+
+    /// The owner's policy holds the worker back: wait until it no longer does, taking the readings
+    /// again every few seconds. Returns `false` on shutdown.
+    async fn wait_for_policy(&mut self, shutdown: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+        let Some(ctl) = self.control.clone() else {
+            return true;
+        };
+        // The card matters only to a worker that computes on it.
+        let gpu = match self.engine {
+            EngineSelection::WgpuVulkan { device_index }
+            | EngineSelection::TorchCuda { device_index } => Some(device_index),
+            EngineSelection::FlexCpu => None,
+        };
+        loop {
+            ctl.reload();
+            let readings = tokio::task::spawn_blocking(move || {
+                let mut r = crate::control::read(gpu.unwrap_or(0));
+                if gpu.is_none() {
+                    r.gpu_temp_c = None;
+                    r.gpu_busy_percent = None;
+                }
+                r
+            })
+            .await
+            .unwrap_or_default();
+            let (day, minute) = crate::control::local_now();
+            let why = crate::control::gate(&ctl.policy(), &readings, day, minute);
+            ctl.update(|s| {
+                s.readings = readings;
+                s.state = if why.is_some() { "waiting" } else { "ready" }.into();
+                s.waiting = why.clone();
+            });
+            if why.is_none() {
+                return true;
+            }
+            tokio::select! {
+                _ = ctl.changed.notified() => {}
+                _ = tokio::time::sleep(crate::control::RECHECK) => {}
+                _ = shutdown.changed() => { if *shutdown.borrow() { return false; } }
+            }
+        }
+    }
+
+    /// Ask the server what this machine earned, now and then, for the owner's dashboard.
+    async fn refresh_earned(&mut self, token: &str) {
+        let Some(ctl) = self.control.clone() else {
+            return;
+        };
+        if self
+            .earned_at
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+        {
+            return;
+        }
+        self.earned_at = Some(Instant::now());
+        if let Ok(me) = self
+            .api
+            .get_json::<serde_json::Value>(token, "/worker/me")
+            .await
+        {
+            ctl.update(|s| {
+                s.earned = me["earned"].as_str().map(str::to_owned);
+                s.accepted = me["accepted"].as_u64();
+            });
+        }
+    }
+
     /// Claim and process tasks until shutdown. `max_tasks` bounds the run (None = unbounded).
     pub async fn run(
         &mut self,
@@ -432,6 +580,17 @@ impl Agent {
     ) -> anyhow::Result<()> {
         if !self.wait_authorized(shutdown.clone()).await? {
             return Ok(());
+        }
+        // Outputs a lab node cannot fetch from here are pushed to it over connections this worker
+        // opens (ADR-0041, A8).
+        if self.serves_peers() {
+            tokio::spawn(push_loop(
+                self.api.clone(),
+                self.cfg.key_path.clone(),
+                self.info.network_id.clone(),
+                self.cache.clone(),
+                shutdown.clone(),
+            ));
         }
         let mut done = 0usize;
         loop {
@@ -447,19 +606,38 @@ impl Agent {
                     continue;
                 }
             };
+            self.keep_node_outputs(&token).await;
+            self.refresh_earned(&token).await;
+            // The owner's policy first (ADR-0043): paused, busy, outside the hours, card too hot.
+            if !self.wait_for_policy(&mut shutdown).await {
+                continue;
+            }
+            // Memory lent: the owner may lend less than the configuration allows, never more.
+            let policy = self
+                .control
+                .as_ref()
+                .map(|c| c.policy())
+                .unwrap_or_default();
+            let ram = policy
+                .max_ram_bytes
+                .map_or(self.cfg.max_ram_bytes, |m| m.min(self.cfg.max_ram_bytes));
+            let device = self.cfg.device_memory().unwrap_or(0);
+            let device = policy.device_memory_bytes.map_or(device, |m| m.min(device));
             // Capabilities (C1): the server only offers what fits. An undeclared GPU announces 0
             // accelerator bytes, which excludes every task that needs some.
             let body = serde_json::json!({
                 "kinds": self.kinds,
                 "wait_secs": self.cfg.claim_wait_secs,
-                "ram_bytes": self.cfg.max_ram_bytes,
-                "device_memory_bytes": self.cfg.device_memory().unwrap_or(0),
+                "ram_bytes": ram,
+                "device_memory_bytes": device,
                 "profile": gg_compute::graph::PROFILE_VERSION,
                 "engine": self.cfg.engine,
                 "agent_version": env!("CARGO_PKG_VERSION"),
                 // The server sizes the lease on this rhythm (several missed heartbeats), so that a
                 // worker that vanishes is replaced quickly.
                 "heartbeat_secs": self.cfg.heartbeat_secs,
+                // Outputs a lab node pulls must be served by their producer (ADR-0041).
+                "serves_peers": self.serves_peers(),
             });
             let claim = tokio::select! {
                 r = self.api.post_json::<ClaimResponse>(&token, "/worker/claim", &body) => r,
@@ -467,8 +645,71 @@ impl Agent {
             };
             match claim {
                 Ok(Some(c)) => {
+                    // Paused while the claim was waiting: the task goes back at once.
+                    if self.control.as_ref().is_some_and(|ctl| ctl.policy().paused) {
+                        let id = c.assignment.body.attempt_id;
+                        if let Err(e) = self
+                            .api
+                            .abandon(&token, id, "paused by the contributor")
+                            .await
+                        {
+                            tracing::debug!(error = %e, "abandon not accepted");
+                        }
+                        continue;
+                    }
                     done += 1;
-                    let outcome = self.process(&token, c, shutdown.clone()).await;
+                    // An immediate pause (ADR-0043) stops the task like a shutdown does, and it is
+                    // abandoned properly; a shutdown still stops everything.
+                    let (abort_tx, abort_rx) = tokio::sync::watch::channel(false);
+                    let watcher = {
+                        let mut sd = shutdown.clone();
+                        let mut aborts = self.control.as_ref().map(|c| c.aborts());
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    r = sd.changed() => {
+                                        if r.is_err() || *sd.borrow() { let _ = abort_tx.send(true); return; }
+                                    }
+                                    r = async { match aborts.as_mut() { Some(a) => a.changed().await, None => std::future::pending().await } } => {
+                                        if r.is_ok() { let _ = abort_tx.send(true); }
+                                        return;
+                                    }
+                                }
+                            }
+                        })
+                    };
+                    if let Some(ctl) = &self.control {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let task = crate::control::Running {
+                            task_id: c.assignment.body.task_id.to_string(),
+                            kind: c.spec.definition.params.compute_kind().to_owned(),
+                            started_ms: now,
+                        };
+                        ctl.update(|s| {
+                            s.state = "computing".into();
+                            s.waiting = None;
+                            s.task = Some(task);
+                        });
+                    }
+                    let outcome = self.process(&token, c, abort_rx).await;
+                    watcher.abort();
+                    if let Some(ctl) = &self.control {
+                        let ok = matches!(outcome, AttemptOutcome::Submitted { .. });
+                        ctl.update(|s| {
+                            s.task = None;
+                            s.state = "ready".into();
+                            if ok {
+                                s.submitted += 1;
+                            } else {
+                                s.abandoned += 1;
+                            }
+                        });
+                        // What was earned just changed.
+                        self.earned_at = None;
+                    }
                     self.processed.push(outcome);
                 }
                 Ok(None) => {}
@@ -642,6 +883,23 @@ impl Agent {
             }
         }
         debug_assert!(use_peers);
+        // Nobody this worker can reach holds it (a lab node behind a NAT): its holder is asked to
+        // push it here instead (ADR-0041, A8), when this worker can be reached.
+        if self.nobody_reachable_holds(token, r).await {
+            match self.receive_by_push(token, r, dest).await {
+                Ok(()) => {
+                    out.peer_chunks +=
+                        r.size.div_ceil(self.info.p2p_chunk_bytes.max(1) as u64) as u32;
+                    if let Err(e) = self.cache.store(&r.hash, dest) {
+                        tracing::warn!(input = name, error = %e, "artifact cache store failed");
+                    }
+                    return Ok(out);
+                }
+                Err(e) => {
+                    tracing::info!(input = name, error = %e, "no push received, trying the usual sources")
+                }
+            }
+        }
         // Swarm: this worker serves each chunk as soon as it has verified it, so it announces
         // itself as a holder before finishing, for the readers starting alongside it to find.
         if sharing && large {
@@ -669,6 +927,7 @@ impl Agent {
                     partials: self.peer_server.as_ref().map(|p| p.partials()),
                     self_fingerprint: self.peer_server.as_ref().map(|p| p.fingerprint()),
                     swarm_patience_ms: self.cfg.p2p.swarm_patience_ms,
+                    tracker: "/worker".into(),
                 },
             )
             .await
@@ -760,106 +1019,58 @@ impl Agent {
         Ok(())
     }
 
-    /// Address other workers were last told to fetch chunks from, when sharing is on.
-    pub async fn peer_addr(&self) -> Option<String> {
-        self.peer_addr.lock().await.as_ref().map(|(a, _)| a.clone())
+    /// Declare an output the job's lab node will pull (ADR-0041), keep it pinned in the cache and
+    /// announce holding it. A worker nobody can reach keeps it too: the node has it pushed (A8).
+    async fn declare_for_node(
+        &mut self,
+        token: &str,
+        attempt: AttemptId,
+        o: &crate::bundle::ReportOutput,
+        bytes: &[u8],
+        bundle: &Bundle,
+    ) -> Result<(), String> {
+        let chunk = self.info.p2p_chunk_bytes as usize;
+        let digests: Vec<String> = bytes
+            .chunks(chunk)
+            .map(|c| Sha256Digest::of_bytes(c).to_hex())
+            .collect();
+        let path = bundle.outputs_dir().join(&o.file_name);
+        self.cache
+            .store(&o.hash, &path)
+            .map_err(|e| format!("cache: {e}"))?;
+        if !self.cache.path_of(&o.hash).exists() {
+            return Err("the artifact cache cannot keep it".into());
+        }
+        self.cache.pin(&o.hash);
+        let declared: Result<Option<serde_json::Value>, _> = self
+            .api
+            .post_json(
+                token,
+                &format!("/worker/attempts/{attempt}/outputs/{}/declare", o.hash),
+                &serde_json::json!({ "size": o.size, "chunks": digests }),
+            )
+            .await;
+        if let Err(e) = declared {
+            self.cache.unpin(&o.hash);
+            return Err(e.to_string());
+        }
+        if !self.announce(token, &o.hash).await {
+            // Not reachable: the node asks for a push, and this worker connects to it (A8).
+            tracing::info!(output = %o.name, "no reachable address: the lab node will have it pushed");
+        }
+        let keep = self.info.pending_output_secs.max(60) as u64 + 60;
+        let now = Instant::now();
+        self.node_outputs.push(NodeOutput {
+            hash: o.hash,
+            until: now + Duration::from_secs(keep),
+            announced: now,
+        });
+        Ok(())
     }
 
-    /// Decide the address to announce. In order: an explicit `advertise_addr`; a NAT-PMP mapping
-    /// obtained from the local gateway; the bound address when it is concrete; otherwise the source
-    /// address the control plane observed for this worker (useful behind a NAT that preserves the
-    /// port). The control plane dials the address back before advertising it, so an unreachable
-    /// worker simply shares nothing (ADR-0013).
-    async fn candidate_addresses(&self, token: &str) -> Vec<Candidate> {
-        let Some(server) = self.peer_server.as_ref() else {
-            return Vec::new();
-        };
-        let bound = server.addr();
-        let far = Duration::from_secs(3600);
-        let mut out = Vec::new();
-
-        // 1. What the contributor configured wins over anything discovered.
-        if !self.cfg.p2p.advertise_addr.is_empty()
-            && let Ok(a) = self.cfg.p2p.advertise_addr.parse::<std::net::SocketAddr>()
-        {
-            let addr = if a.port() == 0 {
-                std::net::SocketAddr::new(a.ip(), bound.port()).to_string()
-            } else {
-                a.to_string()
-            };
-            out.push(Candidate::new(addr, "configured", far));
-        }
-
-        // 2. IPv6 first when the peer server can answer on it: there is no NAT to traverse, so no
-        // mapping to obtain, renew or clean up. The control plane still dials the address back
-        // before advertising it, which is what catches a firewall that blocks incoming IPv6.
-        if self.cfg.p2p.ipv6
-            && (bound.is_ipv6() || bound.ip().is_unspecified())
-            && let Some(v6) = crate::nat_probe::global_ipv6()
-        {
-            let addr =
-                std::net::SocketAddr::new(std::net::IpAddr::V6(v6), bound.port()).to_string();
-            out.push(Candidate::new(addr, "ipv6", far));
-        }
-
-        // 3. Then the port-mapping protocols, for IPv4 behind a NAT.
-        if self.cfg.p2p.nat_pmp {
-            let gateway = self
-                .cfg
-                .p2p
-                .nat_pmp_gateway
-                .parse::<std::net::SocketAddr>()
-                .ok();
-            match crate::natpmp::map_port(
-                bound.port(),
-                self.cfg.p2p.nat_pmp_lifetime_secs,
-                Duration::from_secs(2),
-                gateway,
-            )
-            .await
-            {
-                Ok((external, mapping)) => {
-                    tracing::info!(
-                        %external,
-                        lifetime_secs = mapping.lifetime_secs,
-                        "gateway mapped a port for peer sharing (NAT-PMP)"
-                    );
-                    // Renew halfway through the granted lifetime, as RFC 6886 advises.
-                    out.push(Candidate::new(
-                        external.to_string(),
-                        "nat-pmp",
-                        Duration::from_secs((mapping.lifetime_secs.max(120) / 2) as u64),
-                    ));
-                }
-                Err(e) => tracing::debug!(error = %e, "no NAT-PMP mapping"),
-            }
-        }
-        if self.cfg.p2p.upnp
-            && let Some(c) = self.map_port_with_upnp(bound).await
-        {
-            out.push(c);
-        }
-
-        // 4. A concrete bound address (laboratory network, single host).
-        if !bound.ip().is_unspecified() {
-            out.push(Candidate::new(bound.to_string(), "bound", far));
-        }
-
-        // 5. Last, the source address the control plane sees. Behind a NAT that preserves the port
-        // this is the reachable one; over IPv6 it is simply this machine.
-        if let Ok(me) = self
-            .api
-            .get_json::<serde_json::Value>(token, "/worker/me")
-            .await
-            && let Some(ip) = me["observed_ip"].as_str()
-            && let Ok(ip) = ip.parse::<std::net::IpAddr>()
-        {
-            let addr = std::net::SocketAddr::new(ip, bound.port()).to_string();
-            if !out.iter().any(|c| c.addr == addr) {
-                out.push(Candidate::new(addr, "observed", Duration::from_secs(600)));
-            }
-        }
-        out
+    /// Address other workers were last told to fetch chunks from, when sharing is on.
+    pub async fn peer_addr(&self) -> Option<String> {
+        self.reach.current().await.map(|(a, _)| a)
     }
 
     /// Counters of the sharing side, when sharing is on.
@@ -870,14 +1081,7 @@ impl Agent {
     /// Stop serving chunks and report what was shared. A port opened on the gateway is closed here:
     /// a worker that stops does not leave a hole behind.
     pub async fn stop_sharing(&mut self) {
-        if let Some((gw, port)) = self.upnp_mapping.lock().await.take() {
-            match gw.delete_port_mapping(port).await {
-                Ok(()) => tracing::info!(port, "UPnP mapping deleted"),
-                Err(e) => {
-                    tracing::warn!(port, error = %e, "could not delete the UPnP mapping; it expires with its lease")
-                }
-            }
-        }
+        self.reach.release().await;
         if let Some(server) = self.peer_server.take() {
             let (chunks, bytes, unauthorized, missing, budget) = server.stats().snapshot();
             tracing::info!(
@@ -892,99 +1096,114 @@ impl Agent {
         }
     }
 
-    /// Ask the gateway for a UPnP-IGD mapping and check it took. Any failure returns `None`, and
-    /// the caller falls back to the address the control plane observed.
-    async fn map_port_with_upnp(&self, bound: std::net::SocketAddr) -> Option<Candidate> {
-        let gateway_ip = match self.cfg.p2p.nat_pmp_gateway.parse::<std::net::SocketAddr>() {
-            Ok(a) => match a.ip() {
-                std::net::IpAddr::V4(v4) => v4,
-                std::net::IpAddr::V6(_) => return None,
-            },
-            Err(_) => crate::natpmp::default_gateway().ok()?,
+    /// Tell the control plane this worker holds an artifact, if sharing is on; returns whether it
+    /// was recorded. Failures are not fatal: peer distribution is an optimization, except for the
+    /// outputs a lab node pulls.
+    async fn announce(&self, token: &str, hash: &Sha256Digest) -> bool {
+        let Some(server) = self.peer_server.as_ref() else {
+            return false;
         };
-        let gw = match crate::upnp::discover(gateway_ip, Duration::from_secs(4)).await {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::info!(error = %e, "no UPnP gateway, using the observed address");
-                return None;
-            }
+        let fingerprint = server.fingerprint();
+        let observed = async {
+            let me: serde_json::Value = self.api.get_json(token, "/worker/me").await.ok()?;
+            me["observed_ip"].as_str()?.parse().ok()
         };
-        let local = crate::nat_probe::local_address_towards(gateway_ip).ok()?;
-        let internal = std::net::SocketAddr::from((std::net::IpAddr::V4(local), bound.port()));
-        let lease = self.cfg.p2p.nat_pmp_lifetime_secs;
-        if let Err(e) = gw
-            .add_port_mapping(internal, bound.port(), lease, "gpu-goblin peer")
+        self.reach
+            .announce(server.addr(), observed, |addr| async move {
+                self.api
+                    .announce_artifact(token, hash, &addr, &fingerprint)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
             .await
-        {
-            tracing::info!(error = %e, "gateway refused a UPnP mapping");
-            return None;
-        }
-        // Trust the gateway's own table, not our request.
-        match gw.get_port_mapping(bound.port()).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                tracing::info!("the gateway accepted a UPnP mapping but does not list it");
-                return None;
-            }
-            Err(e) => tracing::debug!(error = %e, "could not read the UPnP mapping back"),
-        }
-        let external = gw.external_address().await.ok()?;
-        *self.upnp_mapping.lock().await = Some((gw, bound.port()));
-        let addr = format!("{external}:{}", bound.port());
-        tracing::info!(%addr, lease_secs = lease, "gateway mapped a port for peer sharing (UPnP-IGD)");
-        Some(Candidate::new(
-            addr,
-            "upnp",
-            Duration::from_secs((lease.max(120) / 2) as u64),
-        ))
+            .is_some()
     }
 
-    /// Tell the control plane this worker holds an artifact, if sharing is on. Failures are not
-    /// fatal: peer distribution is an optimization, never a dependency.
-    async fn announce(&self, token: &str, hash: &Sha256Digest) {
-        let Some(server) = self.peer_server.as_ref() else {
-            return;
-        };
-        let known = {
-            let guard = self.peer_addr.lock().await;
-            match guard.as_ref() {
-                Some((addr, renew)) if Instant::now() < *renew => Some(addr.clone()),
-                _ => None,
-            }
-        };
-        if let Some(addr) = known {
-            if let Err(e) = self
-                .api
-                .announce_artifact(token, hash, &addr, &server.fingerprint())
-                .await
-            {
-                tracing::debug!(%hash, error = %e, "announce refused, resolving the address again");
-                *self.peer_addr.lock().await = None;
-            }
-            return;
+    /// Whether no holder of `r` can be reached and the control plane has no copy either (A8).
+    async fn nobody_reachable_holds(&self, token: &str, r: &ArtifactRef) -> bool {
+        if self.peer_server.is_none() {
+            return false;
         }
-        // Offer each candidate until the control plane accepts one. Its dial-back is the judge of
-        // reachability: an address nobody can connect to is never advertised to other workers.
-        for candidate in self.candidate_addresses(token).await {
-            match self
-                .api
-                .announce_artifact(token, hash, &candidate.addr, &server.fingerprint())
-                .await
-            {
-                Ok(a) => {
-                    tracing::info!(addr = %a.addr, how = candidate.how, "announced a reachable address");
-                    *self.peer_addr.lock().await = Some((candidate.addr, candidate.renew));
-                    return;
+        let Ok(peers) = self
+            .api
+            .get_json::<serde_json::Value>(token, &format!("/worker/artifacts/{}/peers", r.hash))
+            .await
+        else {
+            return false;
+        };
+        peers["peers"].as_array().is_none_or(|p| p.is_empty())
+            && peers["server_holds"] == serde_json::json!(false)
+    }
+
+    /// Receive `r` by push at this worker's chunk server (A8).
+    async fn receive_by_push(
+        &self,
+        token: &str,
+        r: &ArtifactRef,
+        dest: &std::path::Path,
+    ) -> Result<(), String> {
+        let server = self.peer_server.as_ref().ok_or("no chunk server")?;
+        let mut addrs: Vec<String> = self
+            .reach
+            .current()
+            .await
+            .map(|(a, _)| a)
+            .into_iter()
+            .collect();
+        let observed = async {
+            let me: serde_json::Value = self.api.get_json(token, "/worker/me").await.ok()?;
+            me["observed_ip"].as_str()?.parse().ok()
+        };
+        for c in self.reach.candidates(server.addr(), observed).await {
+            if !addrs.contains(&c.addr) {
+                addrs.push(c.addr);
+            }
+        }
+        gg_client::p2p::fetch_by_push(
+            &self.api,
+            token,
+            "/worker",
+            &self.info.network_id,
+            &self.info.server_public_key,
+            r,
+            dest,
+            server,
+            &addrs,
+            Duration::from_secs(self.cfg.p2p.request_timeout_secs.max(5) * 3),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    }
+
+    /// Whether this worker keeps its outputs and serves them: it may take jobs a lab node holds.
+    fn serves_peers(&self) -> bool {
+        self.cfg.p2p.enabled && self.cfg.p2p.share && self.info.p2p_chunk_bytes > 0
+    }
+
+    /// Announce again the outputs kept for a lab node, and release those past their deadline.
+    async fn keep_node_outputs(&mut self, token: &str) {
+        let now = Instant::now();
+        let (live, done): (Vec<NodeOutput>, Vec<NodeOutput>) =
+            std::mem::take(&mut self.node_outputs)
+                .into_iter()
+                .partition(|o| now < o.until);
+        for o in done {
+            self.cache.unpin(&o.hash);
+        }
+        let mut kept = Vec::with_capacity(live.len());
+        for mut o in live {
+            if now.duration_since(o.announced) >= NODE_OUTPUT_REANNOUNCE {
+                // Refused once the node holds it (it is no longer pending): nothing left to serve.
+                if !self.announce(token, &o.hash).await {
+                    self.cache.unpin(&o.hash);
+                    continue;
                 }
-                Err(e) => tracing::info!(
-                    addr = %candidate.addr,
-                    how = candidate.how,
-                    error = %e,
-                    "the control plane could not use this address, trying the next one"
-                ),
+                o.announced = now;
             }
+            kept.push(o);
         }
-        tracing::info!("no reachable address for peer sharing: this worker only fetches");
+        self.node_outputs = kept;
     }
 
     /// Release the cache pins taken for an attempt.
@@ -1161,6 +1380,9 @@ impl Agent {
                 gg_protocol::messages::TaskParamsV1::GraphStage(_)
             );
         self.deferred.clear();
+        // A lab node pulls the outputs of this job (ADR-0041): the large ones are declared and
+        // served from here; the control plane only relays the small ones.
+        let to_node = claim.outputs_to_node && self.serves_peers();
         // Check each output, declare the large activations, then upload the rest concurrently:
         // on a real network each upload costs at least a round trip.
         let mut to_upload = Vec::new();
@@ -1183,6 +1405,22 @@ impl Agent {
                     size: o.size,
                 },
             );
+            if to_node
+                && (o.size >= self.cfg.p2p.min_bytes || o.size > self.info.node_relay_max_bytes)
+            {
+                match self
+                    .declare_for_node(token, a.body.attempt_id, o, &bytes, &bundle)
+                    .await
+                {
+                    Ok(()) => continue,
+                    Err(e) if o.size > self.info.node_relay_max_bytes => {
+                        return Err(format!("output {} for the lab node: {e}", o.name));
+                    }
+                    Err(e) => {
+                        tracing::warn!(output = %o.name, error = %e, "declaration for the lab node refused, uploading it")
+                    }
+                }
+            }
             // A small artifact is uploaded right away: declaring and then serving it would cost
             // more than sending it (`p2p.min_bytes`).
             if handoff
@@ -1287,7 +1525,38 @@ impl Agent {
                 .await;
         }
         let exe = self.cfg.executor().map_err(|e| e.to_string())?;
-        let mut cmd = match self.cfg.sandbox_mode() {
+        let mut cmd: crate::launch::Launch = match self.cfg.sandbox_mode() {
+            crate::sandbox::SandboxMode::AppContainer => {
+                #[cfg(windows)]
+                {
+                    let device = self.cfg.device_memory().unwrap_or(0).to_string();
+                    let mut inner: Vec<std::ffi::OsString> = vec![
+                        "run".into(),
+                        "--task-dir".into(),
+                        bundle.root.clone().into(),
+                        "--engine".into(),
+                        self.cfg.engine.clone().into(),
+                        "--restrict".into(),
+                        "--device-memory".into(),
+                        device.into(),
+                    ];
+                    if let Some(k) = &self.kernel_cache {
+                        inner.extend(["--kernel-cache".into(), k.clone().into()]);
+                    }
+                    crate::launch::Launch::AppContainer(crate::appcontainer::executor_spec(
+                        &exe,
+                        &bundle.root,
+                        false,
+                        inner,
+                        self.kernel_cache.as_deref(),
+                        self.cfg.libtorch_dir.as_deref(),
+                        max_ram.saturating_add(512 << 20),
+                        (self.cfg.cpu_quota_percent > 0).then_some(self.cfg.cpu_quota_percent),
+                    )?)
+                }
+                #[cfg(not(windows))]
+                return Err("the appcontainer sandbox exists only on Windows".into());
+            }
             crate::sandbox::SandboxMode::Bwrap => {
                 let bwrap =
                     crate::sandbox::find_bwrap().ok_or("bubblewrap (bwrap) not found in PATH")?;
@@ -1328,7 +1597,7 @@ impl Agent {
                     };
                     plan = plan.with_cgroup(&sr, limits);
                 }
-                crate::sandbox::command(&plan)
+                crate::launch::Launch::Command(crate::sandbox::command(&plan))
             }
             crate::sandbox::SandboxMode::None => {
                 let mut cmd = tokio::process::Command::new(&exe);
@@ -1344,19 +1613,15 @@ impl Agent {
                 if let Some(dir) = &self.cfg.libtorch_dir {
                     cmd.env("LD_LIBRARY_PATH", dir);
                 }
-                cmd
+                crate::launch::Launch::Command(cmd)
             }
         };
         cmd.env(
             "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+            &std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+        );
         let mut child = cmd
-            .spawn()
+            .spawn(false)
             .map_err(|e| format!("spawn executor {}: {e}", exe.display()))?;
         let mut stderr = child.stderr.take();
         let stderr_task = tokio::spawn(async move {
@@ -1440,11 +1705,43 @@ impl Agent {
 
     /// The command of an executor session: `gg-executor serve` in the task sandbox, binding the
     /// session's bundle directory, under the worker's memory limit.
-    fn session_command(&self, root: &std::path::Path) -> Result<tokio::process::Command, String> {
+    fn session_command(&self, root: &std::path::Path) -> Result<crate::launch::Launch, String> {
         let exe = self.cfg.executor().map_err(|e| e.to_string())?;
         let device = self.cfg.device_memory().unwrap_or(0).to_string();
         let max_file = self.cfg.max_disk_bytes.to_string();
-        let mut cmd = match self.cfg.sandbox_mode() {
+        let mut cmd: crate::launch::Launch = match self.cfg.sandbox_mode() {
+            crate::sandbox::SandboxMode::AppContainer => {
+                #[cfg(windows)]
+                {
+                    let mut inner: Vec<std::ffi::OsString> = vec![
+                        "serve".into(),
+                        "--root".into(),
+                        root.into(),
+                        "--engine".into(),
+                        self.cfg.engine.clone().into(),
+                        "--restrict".into(),
+                        "--device-memory".into(),
+                        device.clone().into(),
+                        "--max-file-bytes".into(),
+                        max_file.clone().into(),
+                    ];
+                    if let Some(k) = &self.kernel_cache {
+                        inner.extend(["--kernel-cache".into(), k.clone().into()]);
+                    }
+                    crate::launch::Launch::AppContainer(crate::appcontainer::executor_spec(
+                        &exe,
+                        root,
+                        true,
+                        inner,
+                        self.kernel_cache.as_deref(),
+                        self.cfg.libtorch_dir.as_deref(),
+                        self.cfg.max_ram_bytes.saturating_add(512 << 20),
+                        (self.cfg.cpu_quota_percent > 0).then_some(self.cfg.cpu_quota_percent),
+                    )?)
+                }
+                #[cfg(not(windows))]
+                return Err("the appcontainer sandbox exists only on Windows".into());
+            }
             crate::sandbox::SandboxMode::Bwrap => {
                 let bwrap =
                     crate::sandbox::find_bwrap().ok_or("bubblewrap (bwrap) not found in PATH")?;
@@ -1486,7 +1783,7 @@ impl Agent {
                     };
                     plan = plan.with_cgroup(&sr, limits);
                 }
-                crate::sandbox::command(&plan)
+                crate::launch::Launch::Command(crate::sandbox::command(&plan))
             }
             crate::sandbox::SandboxMode::None => {
                 let mut cmd = tokio::process::Command::new(&exe);
@@ -1504,12 +1801,12 @@ impl Agent {
                 if let Some(dir) = &self.cfg.libtorch_dir {
                     cmd.env("LD_LIBRARY_PATH", dir);
                 }
-                cmd
+                crate::launch::Launch::Command(cmd)
             }
         };
         cmd.env(
             "RUST_LOG",
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+            &std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
         );
         Ok(cmd)
     }

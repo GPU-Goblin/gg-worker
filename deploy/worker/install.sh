@@ -3,7 +3,7 @@
 #
 #   curl -fsSLO https://grid.gpugoblin.com/releases/latest/install.sh
 #   less install.sh                      # read it: it is short, and it is what you trust
-#   bash install.sh [--gpu | --cuda] [--server-url URL] [--release-url URL] [--allowed-signers FILE]
+#   bash install.sh [--gpu | --cuda] [--gpus all|N] [--server-url URL] [--release-url URL] [--allowed-signers FILE]
 #
 # What it does, in order, stopping at the first failure:
 #   1. downloads SHA256SUMS and SHA256SUMS.sshsig from the release directory;
@@ -14,7 +14,11 @@
 #   4. installs them under ~/.local/lib/gpu-goblin/<version>/ and points "current" at it;
 #   5. writes ~/.config/gpu-goblin/worker.toml from the signed template (never overwrites yours);
 #   6. creates the worker key, runs `gg-worker doctor` and refuses to go on unless it passes;
-#   7. installs and starts the systemd user service gg-worker (unless --no-start).
+#   7. installs and starts the systemd user service gg-worker (unless --no-start); with --gpus, one
+#      worker per graphics card: gg-worker for the first, gg-worker@1, gg-worker@2... for the others;
+#   8. when the release has it, installs the GPU Goblin application (gg-desk): in the terminal
+#      (`gg-desk status`, `gg-desk console`) always, with a menu entry started with the session on
+#      a desktop (unless --no-desktop).
 # The only use of sudo is to install bubblewrap from your distribution, and only if you say yes.
 #
 # The release key used the first time is pinned in ~/.config/gpu-goblin/allowed_signers; a later run
@@ -43,6 +47,8 @@ variant="cpu"
 allowed_signers_file=""
 libtorch_archive=""
 start=yes
+desktop=yes
+gpus=1
 assume_yes=no
 prefix="$HOME/.local/lib/gpu-goblin"
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/gpu-goblin"
@@ -60,12 +66,16 @@ Options:
   --gpu                   install the GPU (Vulkan) build instead of the CPU one
   --cuda                  NVIDIA cards: the native CUDA engine, several times faster on convolutional
                           networks; downloads LibTorch (3.9 GB, 6.0 GB unpacked) from PyTorch
+  --gpus all|N            with --gpu or --cuda: one worker per graphics card, all attached to the
+                          same account (all: every card this machine has)
   --libtorch-archive FILE with --cuda: use this copy of the LibTorch archive instead of downloading
                           it (checked against the same signed digest)
   --enroll CODE           enrollment code from the contributor portal (gge_...): the machine
                           attaches itself to your account on its first start
   --allowed-signers FILE  OpenSSH allowed_signers file with the release key (instead of the one above)
   --no-start              install and check, but do not enable or start the service
+  --no-desktop            no menu entry nor start with the session (servers: gg-desk still works
+                          in the terminal)
   --yes                   answer yes to questions (bubblewrap installation)
 EOF
 }
@@ -83,10 +93,12 @@ while [[ $# -gt 0 ]]; do
 	--network) network="${2:?}" && shift 2 ;;
 	--gpu) variant=gpu && shift ;;
 	--cuda) variant=cuda && shift ;;
+	--gpus) gpus="${2:?}" && shift 2 ;;
 	--libtorch-archive) libtorch_archive="${2:?}" && shift 2 ;;
 	--enroll) enroll="${2:?}" && shift 2 ;;
 	--allowed-signers) allowed_signers_file="${2:?}" && shift 2 ;;
 	--no-start) start=no && shift ;;
+	--no-desktop) desktop=no && shift ;;
 	--yes) assume_yes=yes && shift ;;
 	-h | --help) usage && exit 0 ;;
 	*) die "unknown option $1 (see --help)" ;;
@@ -95,6 +107,29 @@ done
 enroll="${enroll:-}"
 [[ -z "$libtorch_archive" || "$variant" == cuda ]] || die "--libtorch-archive goes with --cuda"
 [[ -z "$enroll" || "$enroll" =~ ^gge_[A-Za-z0-9_-]{16,120}$ ]] || die "--enroll expects the code shown on the contributor portal (gge_...)"
+# The graphics cards of this machine: as nvidia-smi numbers them (the order CUDA and the worker
+# use), else the AMD and NVIDIA cards the kernel sees.
+count_gpus() {
+	if command -v nvidia-smi >/dev/null; then
+		nvidia-smi -L 2>/dev/null | grep -c '^GPU ' || true
+		return
+	fi
+	local n=0 v
+	for v in /sys/class/drm/card*/device/vendor; do
+		[[ "$v" =~ /card[0-9]+/device/vendor$ ]] || continue
+		case "$(cat "$v")" in 0x1002 | 0x10de) n=$((n + 1)) ;; esac
+	done
+	echo "$n"
+}
+if [[ "$gpus" != 1 ]]; then
+	[[ "$variant" != cpu ]] || die "--gpus goes with --gpu or --cuda"
+	if [[ "$gpus" == all ]]; then
+		gpus="$(count_gpus)"
+		[[ "$gpus" -ge 1 ]] || die "--gpus all: no graphics card found (give their number: --gpus N)"
+		echo "graphics cards found: $gpus"
+	fi
+	[[ "$gpus" =~ ^[0-9]+$ && "$gpus" -ge 1 && "$gpus" -le 16 ]] || die "--gpus expects all or a number from 1 to 16"
+fi
 server_url="${server_url%/}"
 release_url="${release_url:-$server_url/releases/latest}"
 release_url="${release_url%/}"
@@ -188,6 +223,12 @@ else
 	worker_src=gg-worker executor_src=gg-executor engine=cpu
 fi
 needed=("$worker_src" "$executor_src" worker.toml.template gg-worker.service)
+# The application, when the release carries it (ADR-0043).
+desk=no
+if awk '$2 == "gg-desk"' "$work/SHA256SUMS" | grep -q .; then
+	needed+=(gg-desk)
+	desk=yes
+fi
 [[ "$variant" == cuda ]] && needed+=(libtorch.sha256)
 : >"$work/needed.sums"
 for f in "${needed[@]}"; do
@@ -245,6 +286,7 @@ dest="$prefix/$version"
 mkdir -p "$dest.partial"
 install -m 0755 "$work/$worker_src" "$dest.partial/gg-worker"
 install -m 0755 "$work/$executor_src" "$dest.partial/gg-executor"
+[[ "$desk" == yes ]] && install -m 0755 "$work/gg-desk" "$dest.partial/gg-desk"
 install -m 0644 "$work/SHA256SUMS" "$work/SHA256SUMS.sshsig" "$dest.partial/"
 rm -rf "$dest"
 mv "$dest.partial" "$dest"
@@ -253,6 +295,31 @@ ln -sfn "$version" "$prefix/current.new"
 mv -T "$prefix/current.new" "$prefix/current"
 mkdir -p "$bin_dir"
 ln -sfn "$prefix/current/gg-worker" "$bin_dir/gg-worker"
+[[ "$desk" == yes ]] && ln -sfn "$prefix/current/gg-desk" "$bin_dir/gg-desk"
+# No desktop here (a server, SSH): the application runs in the terminal, nothing to start with a
+# session that has no screen.
+if [[ "$desk" == yes && "$desktop" == yes && -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}${XDG_CURRENT_DESKTOP:-}" ]]; then
+	desktop=no
+	echo "no desktop session: gg-desk is installed for the terminal only (gg-desk status, gg-desk console)"
+fi
+if [[ "$desk" == yes && "$desktop" == yes ]]; then
+	# A menu entry, and the application started with the session (its tray icon).
+	apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+	autostart="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+	mkdir -p "$apps" "$autostart"
+	cat >"$apps/gpu-goblin.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=GPU Goblin
+Comment=Lend this computer to research: pause, hours, limits
+Exec=$prefix/current/gg-desk
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Utility;Science;
+DESKTOP
+	# With the session: straight into the system tray, the window opens from its icon.
+	sed 's|^Exec=.*|Exec='"$prefix"'/current/gg-desk --tray|' "$apps/gpu-goblin.desktop" >"$autostart/gpu-goblin.desktop"
+fi
 [[ -n "$previous" && "$previous" != "$version" ]] && echo "previous version kept: $prefix/$previous"
 
 # --- 5. Configuration ------------------------------------------------------------------------------
@@ -260,61 +327,83 @@ config="$config_dir/worker.toml"
 mkdir -p "$config_dir" "$data_dir"
 chmod 700 "$data_dir"
 install -m 0644 "$work/allowed_signers" "$pinned"
-if [[ -f "$config" ]]; then
-	echo "keeping your existing $config"
-else
-	name="$(hostname -s 2>/dev/null || echo worker)"
-	sed -e "s#@SERVER_URL@#$server_url#" -e "s#@DATA_DIR@#$data_dir#" \
-		-e "s#@DISPLAY_NAME@#$name#" -e "s#@ENGINE@#$engine#" \
-		-e "s#@ENROLLMENT_TOKEN@#$enroll#" \
-		"$work/worker.toml.template" >"$config.new"
-	! grep -q '@[A-Z_]*@' "$config.new" || die "template markers left in $config.new"
-	chmod 600 "$config.new"
-	mv "$config.new" "$config"
-	echo "wrote $config"
-fi
-# Sets `key = value` in the configuration, replacing an existing line or adding one at the top.
+name="$(hostname -s 2>/dev/null || echo worker)"
+# Sets `key = value` in configuration $1, replacing an existing line or adding one at the top.
 set_config() {
-	if grep -q "^$1 *=" "$config"; then
-		sed -i "s#^$1 *=.*#$1 = $2#" "$config"
+	if grep -q "^$2 *=" "$1"; then
+		sed -i "s#^$2 *=.*#$2 = $3#" "$1"
 	else
-		printf '%s = %s\n' "$1" "$2" >"$config.new" && cat "$config" >>"$config.new" && mv "$config.new" "$config"
+		printf '%s = %s\n' "$2" "$3" >"$1.new" && cat "$1" >>"$1.new" && mv "$1.new" "$1"
 	fi
 }
-if [[ "$variant" == cuda ]]; then
-	# Asked for explicitly: also on a reinstall over an existing configuration.
-	set_config engine '"cuda"'
-	set_config libtorch_dir "\"$libtorch_lib\""
-	if ! grep -q '^device_memory_bytes *=' "$config" && command -v nvidia-smi >/dev/null; then
-		total_mib="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0 2>/dev/null | head -n 1 | tr -dc 0-9)"
-		if [[ -n "$total_mib" ]]; then
-			# 85 % of the card, a margin for the display and the driver.
-			set_config device_memory_bytes "$(( total_mib * 1048576 * 85 / 100 ))"
-			echo "device_memory_bytes set to 85 % of the card's $total_mib MiB (edit $config to change it)"
-		fi
-	fi
-	chmod 600 "$config"
-	echo "engine = \"cuda\", libtorch_dir = $libtorch_lib"
-fi
-if [[ -n "$enroll" ]]; then
-	# Also on a reinstall: the code in an existing configuration is replaced, nothing else.
-	if grep -q '^enrollment_token *=' "$config"; then
-		sed -i "s#^enrollment_token *=.*#enrollment_token = \"$enroll\"#" "$config"
+# One worker's configuration: file, data directory, display name, engine, card number ("" for a
+# machine with one worker).
+configure() {
+	local file="$1" dir="$2" label="$3" eng="$4" card="$5"
+	mkdir -p "$dir"
+	chmod 700 "$dir"
+	if [[ -f "$file" ]]; then
+		echo "keeping your existing $file"
 	else
-		printf 'enrollment_token = "%s"\n' "$enroll" >"$config.new" && cat "$config" >>"$config.new" && mv "$config.new" "$config"
+		sed -e "s#@SERVER_URL@#$server_url#" -e "s#@DATA_DIR@#$dir#" \
+			-e "s#@DISPLAY_NAME@#$label#" -e "s#@ENGINE@#$eng#" \
+			-e "s#@ENROLLMENT_TOKEN@#$enroll#" \
+			"$work/worker.toml.template" >"$file.new"
+		! grep -q '@[A-Z_]*@' "$file.new" || die "template markers left in $file.new"
+		chmod 600 "$file.new"
+		mv "$file.new" "$file"
+		echo "wrote $file"
 	fi
-	chmod 600 "$config"   # the enrollment code attaches machines to your account: keep it private
+	if [[ -n "$card" && "$card" != 0 ]]; then
+		# The first worker answers the application on the usual port, the others on any free one
+		# (each writes its address next to its key, where gg-desk finds it).
+		set_config "$file" control_listen '"127.0.0.1:0"'
+		set_config "$file" engine "\"$eng\""
+	fi
+	if [[ "$variant" == cuda ]]; then
+		# Asked for explicitly: also on a reinstall over an existing configuration.
+		set_config "$file" engine "\"$eng\""
+		set_config "$file" libtorch_dir "\"$libtorch_lib\""
+		if ! grep -q '^device_memory_bytes *=' "$file" && command -v nvidia-smi >/dev/null; then
+			total_mib="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "${card:-0}" 2>/dev/null | head -n 1 | tr -dc 0-9)"
+			if [[ -n "$total_mib" ]]; then
+				# 85 % of the card, a margin for the display and the driver.
+				set_config "$file" device_memory_bytes "$(( total_mib * 1048576 * 85 / 100 ))"
+				echo "device_memory_bytes set to 85 % of card ${card:-0}'s $total_mib MiB (edit $file to change it)"
+			fi
+		fi
+		echo "engine = \"$eng\", libtorch_dir = $libtorch_lib"
+	fi
+	if [[ -n "$enroll" ]]; then
+		# Also on a reinstall: the code in an existing configuration is replaced, nothing else.
+		set_config "$file" enrollment_token "\"$enroll\""
+	fi
+	chmod 600 "$file"   # the enrollment code attaches machines to your account: keep it private
+}
+# One worker per card: the first where a single worker lives, the others in gpu1, gpu2...
+configs=("$config")
+if [[ "$gpus" -gt 1 ]]; then
+	configure "$config" "$data_dir" "$name" "$engine" 0
+	for ((k = 1; k < gpus; k++)); do
+		configure "$config_dir/worker-gpu$k.toml" "$data_dir/gpu$k" "$name-gpu$k" "$engine:$k" "$k"
+		configs+=("$config_dir/worker-gpu$k.toml")
+	done
+else
+	configure "$config" "$data_dir" "$name" "$engine" ""
 fi
 
 # --- 6. Identity and checks -------------------------------------------------------------------------
-step "Worker identity"
 worker="$prefix/current/gg-worker"
-pubkey="$("$worker" --config "$config" init)" || die "gg-worker init failed"
-echo "worker public key: $pubkey"
+pubkeys=()
+for c in "${configs[@]}"; do
+	step "Worker identity ($c)"
+	pubkey="$("$worker" --config "$c" init)" || die "gg-worker init failed ($c)"
+	echo "worker public key: $pubkey"
+	pubkeys+=("$pubkey")
 
-step "gg-worker doctor (sandbox, cgroups, engine)"
-if ! "$worker" --config "$config" doctor; then
-	cat >&2 <<'EOF'
+	step "gg-worker doctor (sandbox, cgroups, engine): $c"
+	if ! "$worker" --config "$c" doctor; then
+		cat >&2 <<'EOF'
 
 The doctor refused this machine. Common causes:
   - cgroup_limits: your user session does not delegate cgroups. See "cgroup delegation" in the
@@ -322,29 +411,46 @@ The doctor refused this machine. Common causes:
     accept limits by rlimits only.
   - sandbox: unprivileged user namespaces are disabled (kernel.unprivileged_userns_clone=0, or an
     AppArmor restriction without a bwrap profile).
-  - engine: --gpu without a usable Vulkan device, or --cuda without a working NVIDIA driver.
+  - engine: --gpu without a usable Vulkan device, or --cuda without a working NVIDIA driver; with
+    --gpus, a card number this machine does not have.
 Fix it, then run this installer again (it is idempotent).
 EOF
-	die "gg-worker doctor did not pass"
-fi
+		die "gg-worker doctor did not pass ($c)"
+	fi
+done
 
 # --- 7. Service -----------------------------------------------------------------------------------
 mkdir -p "$unit_dir"
 install -m 0644 "$work/gg-worker.service" "$unit_dir/gg-worker.service"
+# The other cards: the same service, one instance per card (gg-worker@1 reads worker-gpu1.toml).
+units=(gg-worker.service)
+if [[ "$gpus" -gt 1 ]]; then
+	sed -e 's#/worker\.toml run#/worker-gpu%i.toml run#' \
+		-e 's#^Description=.*#Description=GPU Goblin worker for graphics card %i (gg-worker)#' \
+		"$work/gg-worker.service" >"$unit_dir/gg-worker@.service.new"
+	grep -q 'worker-gpu%i.toml run' "$unit_dir/gg-worker@.service.new" || die "cannot derive gg-worker@.service"
+	chmod 0644 "$unit_dir/gg-worker@.service.new"
+	mv "$unit_dir/gg-worker@.service.new" "$unit_dir/gg-worker@.service"
+	for ((k = 1; k < gpus; k++)); do units+=("gg-worker@$k.service"); done
+fi
 if [[ "$start" == yes ]]; then
-	step "Starting the user service gg-worker"
+	step "Starting the user service${units[1]:+s} ${units[*]}"
 	systemctl --user daemon-reload || die "systemctl --user is not available in this session"
-	systemctl --user enable gg-worker.service >/dev/null
-	systemctl --user restart gg-worker.service
+	for u in "${units[@]}"; do
+		systemctl --user enable "$u" >/dev/null
+		systemctl --user restart "$u"
+	done
 	sleep 3
-	systemctl --user is-active --quiet gg-worker.service ||
-		die "gg-worker did not stay up: journalctl --user -u gg-worker -n 50"
+	for u in "${units[@]}"; do
+		systemctl --user is-active --quiet "$u" ||
+			die "$u did not stay up: journalctl --user -u $u -n 50"
+	done
 	echo "running. Logs: journalctl --user -u gg-worker -f"
 	if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || echo no)" != yes ]]; then
 		echo "note: it stops when you log out; to keep it running: loginctl enable-linger $USER"
 	fi
 else
-	echo "service installed, not started (--no-start): systemctl --user enable --now gg-worker"
+	echo "service${units[1]:+s} installed, not started (--no-start): systemctl --user enable --now ${units[*]}"
 fi
 
 if grep -q '^enrollment_token = "gge_' "$config"; then
@@ -353,13 +459,14 @@ contributor page within a minute."
 else
 	attach="No enrollment code: send this public key to the operator so that they authorize it,
 or run this installer again with --enroll <code from the contributor portal>:
-  $pubkey
+$(printf '  %s\n' "${pubkeys[@]}")
 Until then the worker waits."
 fi
 cat <<EOF
 
-Done: GPU Goblin worker $version ($engine) installed.
+Done: GPU Goblin worker $version ($engine) installed$([[ "$gpus" -gt 1 ]] && echo ", one per graphics card ($gpus)").
 $attach
+$([[ "$desk" == yes ]] && echo "See and control it: gg-desk (window), gg-desk status or gg-desk console (terminal).")
 Peer-to-peer sharing is ON: your public ip:port is visible to the other workers authorized on the
 same data. Turn it off in $config ([p2p] enabled = false).
 EOF

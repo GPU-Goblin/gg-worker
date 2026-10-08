@@ -24,6 +24,11 @@ pub struct WorkerConfig {
     pub engine: String,
     /// Compute kinds this worker accepts.
     pub kinds: Vec<String>,
+    /// Local control API for the owner's application (ADR-0043), on this machine only; empty: none.
+    pub control_listen: String,
+    /// The owner's policy (pause, idle, hours, GPU); default: `policy.toml` next to the key. The
+    /// control token (`control.token`, readable by the user alone) is written next to it.
+    pub policy_path: Option<PathBuf>,
     /// Concurrent tasks (P1: 1).
     pub concurrency: u32,
     /// Local RAM limit for the executor (bytes).
@@ -207,6 +212,8 @@ impl Default for WorkerConfig {
             enrollment_token: String::new(),
             engine: "cpu".into(),
             kinds: vec!["tensor.matmul.v1".into()],
+            control_listen: "127.0.0.1:7460".into(),
+            policy_path: None,
             concurrency: 1,
             max_ram_bytes: 4 << 30,
             device_memory_bytes: None,
@@ -221,7 +228,12 @@ impl Default for WorkerConfig {
             heartbeat_secs: 30,
             executor_path: None,
             keep_failed_bundles: false,
-            sandbox: "bwrap".into(),
+            sandbox: if cfg!(windows) {
+                "appcontainer"
+            } else {
+                "bwrap"
+            }
+            .into(),
             cgroups: "auto".into(),
             cpu_quota_percent: 0,
             dev_unsafe_no_isolation: false,
@@ -229,6 +241,22 @@ impl Default for WorkerConfig {
             dev_faults: DevFaults::default(),
             p2p: P2pConfig::default(),
         }
+    }
+}
+
+impl WorkerConfig {
+    /// Where the owner's policy lives.
+    pub fn policy_file(&self) -> PathBuf {
+        self.policy_path.clone().unwrap_or_else(|| {
+            self.key_path
+                .parent()
+                .map_or_else(|| PathBuf::from("policy.toml"), |d| d.join("policy.toml"))
+        })
+    }
+
+    /// Where the control API's token lives.
+    pub fn control_token_file(&self) -> PathBuf {
+        self.policy_file().with_file_name("control.token")
     }
 }
 
@@ -292,11 +320,10 @@ impl WorkerConfig {
         let engine =
             gg_compute::EngineSelection::parse(&self.engine).map_err(|e| anyhow::anyhow!("{e}"))?;
         let profile = engine.numeric_profile();
-        Ok(self
-            .kinds
-            .iter()
-            .cloned()
-            .partition(|k| gg_compute::profiles::admitted_for(k, profile)))
+        // A comparison of two computations (ADR-0042) runs on the CPU whatever the engine.
+        Ok(self.kinds.iter().cloned().partition(|k| {
+            gg_compute::profiles::admitted_for(k, profile) || k == "replica.compare.v1"
+        }))
     }
 
     /// Validate local policy.
@@ -331,8 +358,17 @@ impl WorkerConfig {
             "cgroups must be auto, require or off"
         );
         let mode = crate::sandbox::SandboxMode::parse(&self.sandbox).ok_or_else(|| {
-            anyhow::anyhow!("sandbox must be bwrap or none, got '{}'", self.sandbox)
+            anyhow::anyhow!(
+                "sandbox must be bwrap, appcontainer or none, got '{}'",
+                self.sandbox
+            )
         })?;
+        anyhow::ensure!(
+            mode.available(),
+            "sandbox = \"{}\" does not exist on {} (bwrap: Linux, appcontainer: Windows)",
+            self.sandbox,
+            std::env::consts::OS
+        );
         if mode == crate::sandbox::SandboxMode::None && !self.dev_unsafe_no_isolation {
             anyhow::bail!("sandbox = \"none\" requires dev_unsafe_no_isolation = true");
         }
@@ -404,7 +440,7 @@ impl WorkerConfig {
         let dir = exe
             .parent()
             .ok_or_else(|| anyhow::anyhow!("no parent dir for current exe"))?;
-        Ok(dir.join("gg-executor"))
+        Ok(dir.join(format!("gg-executor{}", std::env::consts::EXE_SUFFIX)))
     }
 }
 

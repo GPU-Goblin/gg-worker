@@ -14,7 +14,7 @@ engine = "@ENGINE@"                            # cpu | gpu | gpu:<index> | cuda 
 # GPU only: memory the executor may use on the card, in bytes, with a margin below its size
 # (for example 12000000000 on a 16 GB card). Without it, the server offers no task that needs it.
 # device_memory_bytes = 12000000000
-kinds = ["tensor.matmul.v1", "mlp.train.v1", "mlp.grad.v1", "graph.grad.v1", "graph.stage.v1"]
+kinds = ["tensor.matmul.v1", "mlp.train.v1", "mlp.grad.v1", "graph.grad.v1", "graph.stage.v1", "replica.compare.v1"]
 concurrency = 1
 
 # What you lend. The executor is confined to these limits (cgroups) on top of the sandbox.

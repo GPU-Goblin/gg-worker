@@ -1,0 +1,4 @@
+# Windows: the C runtime linked in, so that the programs start on a fresh Windows, which has no
+# Visual C++ runtime (VCRUNTIME140.dll); measured on a Windows 11 virtual machine (ADR-0045).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -101,6 +101,9 @@ enum Cmd {
         /// Also check the native CUDA engine on this device under restriction.
         #[arg(long)]
         cuda_init: Option<usize>,
+        /// The sandbox's memory limit, in bytes: allocating past it must fail (Windows).
+        #[arg(long)]
+        memory_limit: Option<u64>,
     },
 }
 
@@ -125,7 +128,8 @@ fn restrict_self(
     };
     let applied = restrict::apply_all(&params)
         .map_err(|e| anyhow::anyhow!("self-restriction failed: {e}"))?;
-    if applied.landlock != "fully_enforced" {
+    // On Windows `apply_all` fails unless the whole sandbox holds (ADR-0045).
+    if cfg!(target_os = "linux") && applied.landlock != "fully_enforced" {
         anyhow::bail!(
             "Landlock is {} on this kernel; refusing to run",
             applied.landlock
@@ -358,6 +362,7 @@ fn main() {
             skip_layers,
             gpu_init,
             cuda_init,
+            memory_limit,
         } => {
             let layers = if no_restrict {
                 None
@@ -375,6 +380,7 @@ fn main() {
                 layers,
                 gpu_init,
                 cuda_init,
+                memory_limit,
             );
             println!("{}", serde_json::to_string(&report).unwrap_or_default());
             Ok(())

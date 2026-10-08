@@ -1,6 +1,5 @@
-//! Executor self-restriction (applied inside the sandbox before any input is read):
-//! Landlock filesystem rules, a seccomp deny-list and resource limits. Also the sandbox probe used
-//! by `gg-worker doctor` to measure what is really enforced.
+//! Linux restriction layers: Landlock filesystem rules, a seccomp deny-list, resource limits, and
+//! the probe that tries to break out of them.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,52 +12,10 @@ use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
     SeccompRule, TargetArch,
 };
-use serde::{Deserialize, Serialize};
 
-/// What was enforced.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Applied {
-    /// Landlock ruleset status: `fully_enforced`, `partially_enforced`, `not_enforced`, `error: …`.
-    pub landlock: String,
-    /// `no_new_privs` set.
-    pub no_new_privs: bool,
-    /// seccomp filter installed.
-    pub seccomp: bool,
-    /// rlimits applied (`RLIMIT_FSIZE`, `RLIMIT_NOFILE`, optionally `RLIMIT_AS`).
-    pub rlimits: Vec<String>,
-}
-
-/// Environment variables the sandbox sets on purpose (`sandbox::plan_with`); any other one found
-/// inside fails `doctor`.
-pub const SANDBOX_ENV: &[&str] = &[
-    "RUST_LOG",
-    "HOME",
-    "PATH",
-    "PWD",
-    "LD_LIBRARY_PATH",
-    "NVIDIA_TF32_OVERRIDE",
-    "CUDA_CACHE_PATH",
-    "__GL_SHADER_DISK_CACHE",
-    "__GL_SHADER_DISK_CACHE_PATH",
-    "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP",
-    "MESA_SHADER_CACHE_DIR",
-];
-
-/// Restriction parameters.
-#[derive(Clone, Debug)]
-pub struct RestrictParams<'a> {
-    /// Bundle root (read-only except `outputs/`).
-    pub bundle: &'a Path,
-    /// Address-space limit in bytes (skipped for GPU engines: driver mappings need large VA).
-    pub max_address_space: Option<u64>,
-    /// Maximum size of any file the executor may create.
-    pub max_file_bytes: u64,
-    /// Compiled GPU kernels kept between tasks, read-write (ADR-0032); `None`: no cache.
-    pub kernel_cache: Option<&'a Path>,
-    /// An executor session (ADR-0034): `bundle` is the directory of the session's attempt
-    /// bundles, writable as a whole, since each attempt's `outputs/` is not known in advance.
-    pub session: bool,
-}
+use super::{
+    Applied, Layers, ProbeReport, RestrictParams, SANDBOX_ENV, check, cuda_check, gpu_check,
+};
 
 /// Apply Landlock: read-only system paths and bundle, read-write `outputs/` and `/tmp`, read-write
 /// `/dev` (device ioctls need `O_RDWR`; inside the sandbox `/dev` only holds the allowed nodes).
@@ -233,32 +190,6 @@ pub fn apply_rlimits(params: &RestrictParams<'_>) -> Result<Vec<String>, String>
     }
     Ok(applied)
 }
-
-/// Which layers to apply (all by default; partial sets exist only for the diagnostic probe).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Layers {
-    /// Resource limits.
-    pub rlimits: bool,
-    /// Landlock filesystem rules.
-    pub landlock: bool,
-    /// seccomp syscall filter.
-    pub seccomp: bool,
-}
-
-impl Layers {
-    /// Everything.
-    pub const ALL: Layers = Layers {
-        rlimits: true,
-        landlock: true,
-        seccomp: true,
-    };
-}
-
-/// Apply everything, in order: rlimits, Landlock, seccomp. Must run before any thread is spawned.
-pub fn apply_all(params: &RestrictParams<'_>) -> Result<Applied, String> {
-    apply_layers(params, Layers::ALL)
-}
-
 /// Apply the selected layers (diagnostics only; tasks always use [`apply_all`]).
 pub fn apply_layers(params: &RestrictParams<'_>, layers: Layers) -> Result<Applied, String> {
     let rlimits = if layers.rlimits {
@@ -289,71 +220,6 @@ pub fn apply_layers(params: &RestrictParams<'_>, layers: Layers) -> Result<Appli
         rlimits,
     })
 }
-
-/// Result of one probe check.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProbeCheck {
-    /// Name.
-    pub name: String,
-    /// Whether the protection held.
-    pub ok: bool,
-    /// Detail.
-    pub detail: String,
-}
-
-/// Probe report printed by `gg-executor probe`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProbeReport {
-    /// What was applied.
-    pub applied: Option<Applied>,
-    /// Error while applying, if any.
-    pub apply_error: Option<String>,
-    /// Checks.
-    pub checks: Vec<ProbeCheck>,
-}
-
-fn check(name: &str, ok: bool, detail: impl Into<String>) -> ProbeCheck {
-    ProbeCheck {
-        name: name.into(),
-        ok,
-        detail: detail.into(),
-    }
-}
-
-#[cfg(feature = "gpu")]
-fn gpu_check(device_index: usize) -> ProbeCheck {
-    match gg_compute::engine::gpu::init_vulkan(device_index) {
-        Ok((_, info)) => check("gpu_init_restricted", true, info.device_name),
-        Err(e) => check("gpu_init_restricted", false, e.to_string()),
-    }
-}
-
-#[cfg(not(feature = "gpu"))]
-fn gpu_check(_device_index: usize) -> ProbeCheck {
-    check(
-        "gpu_init_restricted",
-        false,
-        "this executor was built without GPU support (feature `gpu`)",
-    )
-}
-
-#[cfg(feature = "cuda")]
-fn cuda_check(device_index: usize) -> ProbeCheck {
-    match gg_compute::engine::cuda::check(device_index) {
-        Ok(info) => check("cuda_init_restricted", true, info.device_name),
-        Err(e) => check("cuda_init_restricted", false, e.to_string()),
-    }
-}
-
-#[cfg(not(feature = "cuda"))]
-fn cuda_check(_device_index: usize) -> ProbeCheck {
-    check(
-        "cuda_init_restricted",
-        false,
-        "this executor was built without the native CUDA engine (feature `cuda`)",
-    )
-}
-
 fn seccomp_mode() -> Option<u32> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
     s.lines()
@@ -372,6 +238,8 @@ pub fn probe(
     layers: Option<Layers>,
     gpu_init: Option<usize>,
     cuda_init: Option<usize>,
+    // The cgroup bounds memory on Linux; the probe does not measure it.
+    _memory_limit: Option<u64>,
 ) -> ProbeReport {
     let mut checks = Vec::new();
     let (applied, apply_error) = if let Some(layers) = layers {
@@ -548,40 +416,5 @@ pub fn probe(
         applied,
         apply_error,
         checks,
-    }
-}
-
-/// cgroup v2 limits of the current process (read from `/sys/fs/cgroup`).
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CgroupReport {
-    /// cgroup path.
-    pub path: String,
-    /// `memory.max` (`max` = unlimited).
-    pub memory_max: String,
-    /// `cpu.max`.
-    pub cpu_max: String,
-    /// `pids.max`.
-    pub pids_max: String,
-}
-
-/// Read the cgroup limits of this process.
-pub fn cgroup_limits() -> CgroupReport {
-    let path = std::fs::read_to_string("/proc/self/cgroup")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("0::").map(str::to_owned))
-        })
-        .unwrap_or_default();
-    let read = |name: &str| {
-        std::fs::read_to_string(format!("/sys/fs/cgroup{path}/{name}"))
-            .map(|s| s.trim().to_owned())
-            .unwrap_or_else(|_| "unreadable".into())
-    };
-    CgroupReport {
-        memory_max: read("memory.max"),
-        cpu_max: read("cpu.max"),
-        pids_max: read("pids.max"),
-        path,
     }
 }

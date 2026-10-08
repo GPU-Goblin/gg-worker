@@ -1,0 +1,65 @@
+[package]
+name = "gg-desk"
+description = "GPU Goblin: the contributor's desktop application (ADR-0043)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gg-desk"
+path = "src/main.rs"
+
+[dependencies]
+gg-client = { workspace = true }
+gg-protocol = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# A pure-Rust interface: no web view to ship or patch, the same code on Linux and Windows.
+eframe = { version = "0.36", default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+# Icons (MIT), mixed with the text.
+egui-phosphor = "0.14"
+png = "0.18"
+# The console mode (servers, SSH): a live view that answers keys.
+crossterm = "0.29"
+toml = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# To run on X11 (XWayland under Wayland): only there can a window hide into the tray and come back.
+winit = { version = "0.30", default-features = false, features = ["x11", "rwh_06"] }
+# The tray icon over D-Bus (StatusNotifierItem): no GTK needed.
+ksni = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# Drawn with Direct3D 12 on Windows: OpenGL 2 is missing without a graphics driver (virtual
+# machines, remote sessions), where Direct3D falls back to Windows' software renderer (measured).
+eframe = { version = "0.36", default-features = false, features = ["wgpu"] }
+# The window's handle, to give it the program's icon in the taskbar.
+raw-window-handle = "0.6"
+# The notification-area icon and its menu (Shell_NotifyIcon underneath).
+tray-icon = { version = "0.25", default-features = false }
+
+[dev-dependencies]
+gg-worker = { path = "../gg-worker" }
+tempfile = { workspace = true }

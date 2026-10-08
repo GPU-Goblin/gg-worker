@@ -47,6 +47,11 @@ ssh-keygen -lf <(grep -o 'ssh-ed25519 [A-Za-z0-9+/=]*' install.sh)   # must prin
 bash install.sh --enroll gge_...   # your enrollment code; add --gpu for the GPU build
 ```
 
+Several graphics cards: add `--gpus all` (or `--gpus 2`) to `--gpu` or `--cuda`. Each card gets
+its own worker, attached to your account by the same code: the first as usual, card k with
+`~/.config/gpu-goblin/worker-gpuk.toml`, `~/.local/share/gpu-goblin/gpuk/` and the service
+`gg-worker@k`.
+
 If the fingerprint differs, stop and tell the operator. The installer:
 
 1. checks the signature of the release's checksum list with `ssh-keygen` (nothing downloaded is run
@@ -67,6 +72,52 @@ To keep the worker running when you are logged out: `loginctl enable-linger "$US
 
 Every failure stops the installer with `ERROR:` and "Nothing was started". Run it again once the
 cause is fixed; it is idempotent.
+
+## The GPU Goblin application
+
+When the release carries it, the installer also installs `gg-desk`: it appears in your menu as
+"GPU Goblin" and starts with your session (an icon in the system tray). It shows what the machine
+is doing and what it earned, pauses and resumes lending, and sets when and how much to lend (below).
+Closing its window keeps the icon; "Quit" in the icon's menu stops the application, not the worker.
+With several cards it shows each one, with its own pause. Opened on a machine without a worker,
+it offers to sign in or create your account (your address, then the code sent to it) and installs
+the worker attached to it, without copying any code. It speaks fifteen languages (side bar). `--no-desktop` skips the menu entry and
+the start with the session; so does a machine without a desktop.
+
+On a server, or over SSH, the same program works in the terminal:
+
+```bash
+gg-desk                       # without a display: a live view (p pause, s stop now, r resume, q quit)
+gg-desk status                # what each worker does; --json for monitoring
+gg-desk pause [--now] [--gpu 1]
+gg-desk resume
+gg-desk set --schedule "mon-fri 19:00-08:00" --schedule "sat,sun 00:00-24:00" --max-temp 80
+gg-desk set --help            # every setting
+```
+
+Its exit code is 0 when done, 1 when refused or failed, 2 when no worker answers.
+
+## When your machine lends
+
+The worker obeys `~/.local/share/gpu-goblin/policy.toml` (next to its key), which the GPU Goblin
+application edits for you; you may edit it by hand too, it is read again within seconds:
+
+```toml
+paused = false                 # true: lend nothing until you set it back
+only_when_idle = true          # lend only while your session is locked, or idle for:
+idle_after_secs = 300
+yield_to_other_gpu_apps = true # a game or a render on the card: no new task
+gpu_max_temp_c = 80            # the card hotter than this: no new task until it cools down
+[[schedule]]                   # no window: at any time
+days = ["mon", "tue", "wed", "thu", "fri"]
+from = "19:00"
+to = "08:00"                   # before `from`: through the night
+```
+
+A task already running finishes; the application's "pause now" abandons it instead, and the grid
+gives it to another machine (no penalty). The worker listens on `127.0.0.1:7460` for the
+application only, behind the token in `control.token` (readable by you alone); set
+`control_listen = ""` in `worker.toml` to turn that off.
 
 ## Native CUDA engine (NVIDIA, optional)
 
@@ -165,8 +216,10 @@ systemctl --user restart gg-worker
 ## Uninstall
 
 ```bash
-systemctl --user disable --now gg-worker
-rm -f ~/.config/systemd/user/gg-worker.service ~/.local/bin/gg-worker
+systemctl --user disable --now gg-worker 'gg-worker@*'
+rm -f ~/.config/systemd/user/gg-worker.service ~/.config/systemd/user/gg-worker@.service \
+  ~/.local/bin/gg-worker ~/.local/bin/gg-desk \
+  ~/.local/share/applications/gpu-goblin.desktop ~/.config/autostart/gpu-goblin.desktop
 rm -rf ~/.local/lib/gpu-goblin ~/.local/share/gpu-goblin ~/.config/gpu-goblin
 ```
 

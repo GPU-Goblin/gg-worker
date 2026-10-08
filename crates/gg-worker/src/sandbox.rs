@@ -15,19 +15,31 @@ use crate::bundle::{
 /// Sandbox backend selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxMode {
-    /// bubblewrap namespaces + executor self-restriction.
+    /// bubblewrap namespaces + executor self-restriction (Linux).
     Bwrap,
+    /// AppContainer + Job Object + executor self-check (Windows, ADR-0045).
+    AppContainer,
     /// No OS-level isolation (development only, requires explicit acknowledgement).
     None,
 }
 
 impl SandboxMode {
-    /// Parse `bwrap` | `none`.
+    /// Parse `bwrap` | `appcontainer` | `none`.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "bwrap" => Some(Self::Bwrap),
+            "appcontainer" => Some(Self::AppContainer),
             "none" => Some(Self::None),
             _ => None,
+        }
+    }
+
+    /// Whether this sandbox exists on this system.
+    pub fn available(self) -> bool {
+        match self {
+            Self::Bwrap => cfg!(target_os = "linux"),
+            Self::AppContainer => cfg!(windows),
+            Self::None => true,
         }
     }
 }
@@ -234,6 +246,10 @@ pub fn plan_with(
     if matches!(engine, EngineSelection::TorchCuda { .. }) {
         // Strict float32: no TF32 in cuDNN or cuBLAS (ADR-0033).
         push(&mut args, &["--setenv", "NVIDIA_TF32_OVERRIDE", "0"]);
+        // `cuda:<index>` numbers the cards as `nvidia-smi` does (the bus order), so that each worker
+        // of a machine with several cards computes on the card whose temperature it watches; CUDA's
+        // own default puts the fastest first.
+        push(&mut args, &["--setenv", "CUDA_DEVICE_ORDER", "PCI_BUS_ID"]);
     }
     if matches!(
         engine,
@@ -326,8 +342,9 @@ mod tests {
     use super::*;
 
     /// The compiled-kernel cache (ADR-0032) is the only other writable bind, and only for a GPU
-    /// engine: a CPU task compiles nothing and gets no cache.
+    /// engine: a CPU task compiles nothing and gets no cache. (bubblewrap: Linux only.)
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_kernel_cache_is_bound_for_a_gpu_engine_only() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("exe");
@@ -407,6 +424,10 @@ mod tests {
             "{a:?}"
         );
         assert!(has(&["--setenv", "NVIDIA_TF32_OVERRIDE", "0"]), "{a:?}");
+        assert!(
+            has(&["--setenv", "CUDA_DEVICE_ORDER", "PCI_BUS_ID"]),
+            "{a:?}"
+        );
         assert!(
             plan.devices.iter().all(|d| !d.starts_with("/dev/dri")),
             "{:?}",

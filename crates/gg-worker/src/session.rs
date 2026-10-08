@@ -7,22 +7,24 @@
 //! ends a session when the run changes, after a bounded number of tasks, and after any failure,
 //! timeout or lost lease.
 
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use gg_core::{ExperimentId, ProjectId};
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
+};
+
+use crate::launch::{Launch, Running};
 
 /// What a session serves: one training run of one project.
 pub type Scope = (ProjectId, ExperimentId);
 
 /// A running executor session.
 pub struct Session {
-    child: Child,
-    stdin: ChildStdin,
-    lines: Lines<BufReader<ChildStdout>>,
+    child: Running,
+    stdin: Box<dyn AsyncWrite + Send + Unpin>,
+    lines: Lines<BufReader<Box<dyn AsyncRead + Send + Unpin>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     /// The run it serves.
     pub scope: Scope,
@@ -52,14 +54,9 @@ const STDERR_TAIL: usize = 64 << 10;
 
 impl Session {
     /// Start `command` (a `gg-executor serve` inside its sandbox) for `scope`.
-    pub fn spawn(mut command: Command, scope: Scope) -> Result<Self, String> {
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+    pub fn spawn(command: Launch, scope: Scope) -> Result<Self, String> {
         let mut child = command
-            .spawn()
+            .spawn(true)
             .map_err(|e| format!("spawn executor session: {e}"))?;
         let stdin = child.stdin.take().ok_or("session stdin")?;
         let stdout = child.stdout.take().ok_or("session stdout")?;
@@ -128,6 +125,6 @@ impl Session {
 
     /// End the session.
     pub async fn kill(mut self) {
-        let _ = self.child.kill().await;
+        self.child.kill().await;
     }
 }

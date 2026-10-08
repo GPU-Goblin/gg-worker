@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/gg-worker",
+    "crates/gg-desk",
 ]
 
 [workspace.package]
@@ -25,6 +26,8 @@ gg-client = { git = "https://github.com/GPU-Goblin/gg-core", tag = "v0.1.0" }
 # --- domain / protocol ---
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+sha2 = "0.11.0"
+getrandom = "0.4.3"
 hex = "0.4.3"
 thiserror = "2.0.20"
 anyhow = "1.0.104"

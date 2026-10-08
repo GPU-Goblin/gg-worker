@@ -1,5 +1,7 @@
 //! Sandbox tests: the breakout probe must hold inside the real sandbox, and a restricted executor
-//! must still compute. Requires bubblewrap on the host (the test fails, it does not skip).
+//! must still compute. Requires bubblewrap on the host (the test fails, it does not skip). The
+//! Windows sandbox has its own tests (`sandbox_windows.rs`).
+#![cfg(target_os = "linux")]
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -296,4 +298,43 @@ fn an_executor_session_serves_several_tasks_in_one_sandbox() {
         1,
         "{stderr}"
     );
+}
+
+/// The worker's own session code (`Session` over `Launch`, as the agent starts it): a task
+/// answered in the real sandbox, a bad name refused, the session killed.
+#[tokio::test]
+async fn the_agents_session_launch_serves_a_task() {
+    use gg_worker::launch::Launch;
+    use gg_worker::session::{Answer, Session};
+    let bwrap = find_bwrap().expect("bubblewrap (bwrap) must be installed for sandbox tests");
+    let root = tempfile::tempdir().unwrap();
+    let (bundle, _, _) = write_matmul_bundle(root.path(), "t1", 1);
+    let inner = [
+        "serve",
+        "--root",
+        SANDBOX_BUNDLE_DIR,
+        "--engine",
+        "cpu",
+        "--restrict",
+        "--max-file-bytes",
+        "67108864",
+    ];
+    let p = plan(
+        &bwrap,
+        executor(),
+        root.path(),
+        EngineSelection::FlexCpu,
+        &inner,
+    )
+    .unwrap();
+    let mut launch = Launch::Command(gg_worker::sandbox::command(&p));
+    launch.env("RUST_LOG", "info");
+    let scope = (ProjectId::new(), ExperimentId::new());
+    let mut s = Session::spawn(launch, scope).unwrap();
+    s.send("t1").await.unwrap();
+    assert!(matches!(s.answer().await, Answer::Done));
+    assert!(bundle.report_file().is_file());
+    s.send("../etc").await.unwrap();
+    assert!(matches!(s.answer().await, Answer::Failed(_)));
+    s.kill().await;
 }
