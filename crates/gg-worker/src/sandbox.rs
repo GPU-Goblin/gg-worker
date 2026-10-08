@@ -186,6 +186,31 @@ pub fn plan_with(
     kernel_cache: Option<&Path>,
     libtorch: Option<&Path>,
 ) -> Result<SandboxPlan, String> {
+    plan_in(
+        bwrap,
+        executor,
+        bundle,
+        engine,
+        inner_args,
+        kernel_cache,
+        libtorch,
+        &|node| node.exists(),
+    )
+}
+
+/// [`plan_with`], asking `node_present` whether each GPU device node exists: the tests build GPU
+/// plans on machines without a card.
+#[allow(clippy::too_many_arguments)]
+fn plan_in(
+    bwrap: &Path,
+    executor: &Path,
+    bundle: &Path,
+    engine: EngineSelection,
+    inner_args: &[&str],
+    kernel_cache: Option<&Path>,
+    libtorch: Option<&Path>,
+    node_present: &dyn Fn(&Path) -> bool,
+) -> Result<SandboxPlan, String> {
     let executor = executor
         .canonicalize()
         .map_err(|e| format!("executor path: {e}"))?;
@@ -263,7 +288,7 @@ pub fn plan_with(
             }
         }
         for d in gpu_devices(engine) {
-            if !d.exists() {
+            if !node_present(&d) {
                 return Err(format!("GPU device node {} is absent", d.display()));
             }
             args.push("--dev-bind".into());
@@ -354,7 +379,7 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::create_dir_all(&cache).unwrap();
         let args = |engine| {
-            plan_with(
+            plan_in(
                 Path::new("/usr/bin/bwrap"),
                 &exe,
                 &bundle,
@@ -362,6 +387,7 @@ mod tests {
                 &["run"],
                 Some(&cache),
                 None,
+                &|_| true,
             )
             .unwrap()
             .args
@@ -394,7 +420,7 @@ mod tests {
         let torch = dir.path().join("libtorch");
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::create_dir_all(&torch).unwrap();
-        let plan = plan_with(
+        let plan = plan_in(
             Path::new("/usr/bin/bwrap"),
             &exe,
             &bundle,
@@ -402,15 +428,9 @@ mod tests {
             &["run"],
             None,
             Some(&torch),
-        );
-        // Device nodes may be absent on a machine without an NVIDIA driver: the plan says so.
-        let plan = match plan {
-            Ok(p) => p,
-            Err(e) => {
-                assert!(e.contains("/dev/nvidia"), "{e}");
-                return;
-            }
-        };
+            &|_| true,
+        )
+        .unwrap();
         let a: Vec<String> = plan
             .args
             .iter()
@@ -464,16 +484,44 @@ mod tests {
         let binds: Vec<&String> = s.iter().filter(|a| *a == "--bind").collect();
         assert_eq!(binds.len(), 1, "only the bundle is bound read-write");
         assert!(p.devices.is_empty());
-        let g = plan(
+        let g = plan_in(
             Path::new("/usr/bin/bwrap"),
             &exe,
             &bundle,
             EngineSelection::WgpuVulkan { device_index: 0 },
             &["run"],
-        );
-        match g {
-            Ok(g) => assert!(g.devices.iter().any(|d| d.ends_with("nvidia0"))),
-            Err(e) => assert!(e.contains("absent")),
+            None,
+            None,
+            &|_| true,
+        )
+        .unwrap();
+        assert!(g.devices.iter().any(|d| d.ends_with("nvidia0")));
+    }
+
+    /// A GPU plan whose device node is missing is refused, never built without the node.
+    #[test]
+    fn a_missing_gpu_device_node_refuses_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("exe");
+        std::fs::write(&exe, b"").unwrap();
+        let bundle = dir.path().join("b");
+        std::fs::create_dir_all(&bundle).unwrap();
+        for engine in [
+            EngineSelection::WgpuVulkan { device_index: 1 },
+            EngineSelection::TorchCuda { device_index: 1 },
+        ] {
+            let e = plan_in(
+                Path::new("/usr/bin/bwrap"),
+                &exe,
+                &bundle,
+                engine,
+                &["run"],
+                None,
+                None,
+                &|node| node != Path::new("/dev/nvidia1"),
+            )
+            .unwrap_err();
+            assert_eq!(e, "GPU device node /dev/nvidia1 is absent");
         }
     }
 }

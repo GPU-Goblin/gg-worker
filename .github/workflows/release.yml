@@ -34,8 +34,15 @@ jobs:
       - name: Toolchain (pinned by rust-toolchain.toml)
         run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - name: bubblewrap (the sandbox tests require it)
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      # Ubuntu 24.04 and later give unprivileged user namespaces only to programs whose AppArmor
+      # profile allows them: bwrap gets one (a contributor's machine needs the same), then must work.
+      - name: bubblewrap and its AppArmor profile (required by the sandbox tests)
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          printf 'abi <abi/4.0>,\ninclude <tunables/global>\nprofile bwrap /usr/bin/bwrap flags=(unconfined) {\n  userns,\n}\n' \
+            | sudo tee /etc/apparmor.d/bwrap > /dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+          bwrap --ro-bind / / --unshare-all true
       - name: Version matches the tag
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "gg-worker") | .version')"
