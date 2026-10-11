@@ -919,44 +919,52 @@ async fn several_chunks_in_flight_fill_the_link_instead_of_waiting_a_round_trip_
     };
     let base = start_control_plane(cp.clone()).await;
     let api = Api::new(&base).unwrap();
-    let mut times = Vec::new();
-    for parallel in [1usize, 4] {
-        let out = tempfile::tempdir().unwrap();
-        let dest = out.path().join("artifact");
-        let t0 = std::time::Instant::now();
-        let stats = fetch_with_peers(
-            &api,
-            "token",
-            &f.reader,
-            &net(),
-            &f.server_key.public_key(),
-            &ArtifactRef {
-                hash: f.hash,
-                size: f.data.len() as u64,
-            },
-            &format!("/worker/artifacts/{}", f.hash),
-            &dest,
-            &FetchConfig {
-                parallel_chunks: parallel,
-                ..cfg()
-            },
-        )
-        .await
-        .unwrap();
-        times.push(t0.elapsed());
-        assert_eq!(std::fs::read(&dest).unwrap(), f.data);
-        assert_eq!(stats.chunks_from_peers, chunks as u32);
-        assert!(stats.peer_connections as usize <= parallel);
+    // Best of up to three paired measurements, same threshold: the tests of this file run
+    // concurrently, and on a two-core CI runner their CPU use once stalled the four-at-a-time
+    // transfer (739 ms one at a time, 801 ms four at a time; the rerun passed).
+    let mut best = [std::time::Duration::MAX; 2];
+    for _attempt in 0..3 {
+        for (slot, parallel) in [1usize, 4].into_iter().enumerate() {
+            let out = tempfile::tempdir().unwrap();
+            let dest = out.path().join("artifact");
+            let t0 = std::time::Instant::now();
+            let stats = fetch_with_peers(
+                &api,
+                "token",
+                &f.reader,
+                &net(),
+                &f.server_key.public_key(),
+                &ArtifactRef {
+                    hash: f.hash,
+                    size: f.data.len() as u64,
+                },
+                &format!("/worker/artifacts/{}", f.hash),
+                &dest,
+                &FetchConfig {
+                    parallel_chunks: parallel,
+                    ..cfg()
+                },
+            )
+            .await
+            .unwrap();
+            best[slot] = best[slot].min(t0.elapsed());
+            assert_eq!(std::fs::read(&dest).unwrap(), f.data);
+            assert_eq!(stats.chunks_from_peers, chunks as u32);
+            assert!(stats.peer_connections as usize <= parallel);
+        }
+        if best[1].as_secs_f64() < 0.6 * best[0].as_secs_f64() {
+            break;
+        }
     }
     eprintln!(
         "[peers] {chunks} chunks behind a 40 ms round trip: {} ms one at a time, {} ms four at a \
 time",
-        times[0].as_millis(),
-        times[1].as_millis()
+        best[0].as_millis(),
+        best[1].as_millis()
     );
     assert!(
-        times[1].as_secs_f64() < 0.6 * times[0].as_secs_f64(),
-        "{times:?}"
+        best[1].as_secs_f64() < 0.6 * best[0].as_secs_f64(),
+        "{best:?}"
     );
     assert_eq!(cp.ranges_served.load(Ordering::SeqCst), 0);
 }
