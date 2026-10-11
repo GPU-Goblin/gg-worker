@@ -13,8 +13,10 @@ with the same bounded, verified code as everyone else. The computation runs in a
 Landlock and seccomp; on Windows by an AppContainer without any capability inside a Job Object
 (ADR-0045 in gg-server). Every result is verified before it is accepted.
 
-> **Status: research software, version 0.1.0.** There is no public GPU Goblin network yet, and no
-> monetary value is attached to credits. See
+> **Status: research software, version 0.1.1, in public beta.** The GPU Goblin grid runs at
+> grid.gpugoblin.com: create an account at [gpugoblin.com/account](https://gpugoblin.com/account/),
+> then install from the [download page](https://gpugoblin.com/download/). Credits count
+> contributions and have no monetary value. What works and what does not:
 > [gg-server/docs/STATUS.md](https://github.com/GPU-Goblin/gg-server/blob/main/docs/STATUS.md).
 
 ## Requirements
