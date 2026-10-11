@@ -2,7 +2,17 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.0] — unreleased
+## [0.1.1] — 2026-10-11
+
+- A stock Ubuntu 24.04 can lend. There AppArmor refuses bubblewrap its user namespaces: `install.sh`
+  explains it and, with the owner's consent, installs the profile Ubuntu documents for a single
+  program, `/etc/apparmor.d/gpu-goblin-bwrap` (never next to a distribution's own profile).
+- The executor accepts Landlock ABI v3 and v4 kernels (Linux 6.2 to 6.9) when every right they know
+  is enforced: they lack only `IoctlDev`, which the ruleset grants on `/dev` anyway (ADR-0009).
+  Older kernels, Debian 12's 6.1 among them, are still refused.
+- The sandbox plan tests run on machines without a graphics card.
+
+## [0.1.0] — 2026-10-11
 
 First public version of the contributor agent.
 

@@ -129,7 +129,7 @@ fn restrict_self(
     let applied = restrict::apply_all(&params)
         .map_err(|e| anyhow::anyhow!("self-restriction failed: {e}"))?;
     // On Windows `apply_all` fails unless the whole sandbox holds (ADR-0045).
-    if cfg!(target_os = "linux") && applied.landlock != "fully_enforced" {
+    if cfg!(target_os = "linux") && !restrict::landlock_holds(&applied.landlock) {
         anyhow::bail!(
             "Landlock is {} on this kernel; refusing to run",
             applied.landlock

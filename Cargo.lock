@@ -3529,7 +3529,7 @@ dependencies = [
 
 [[package]]
 name = "gg-desk"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3577,7 +3577,7 @@ dependencies = [
 
 [[package]]
 name = "gg-worker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",

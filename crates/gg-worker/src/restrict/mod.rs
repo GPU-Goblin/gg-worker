@@ -21,7 +21,9 @@ pub use windows::{apply_layers, probe};
 /// What was enforced.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Applied {
-    /// Landlock ruleset status: `fully_enforced`, `partially_enforced`, `not_enforced`, `error: …`.
+    /// Landlock ruleset status: `fully_enforced`, `enforced_abi_v3` or `enforced_abi_v4` (every
+    /// right that kernel knows: [`landlock_holds`]), `partially_enforced`, `not_enforced`,
+    /// `error: …`.
     pub landlock: String,
     /// `no_new_privs` set.
     pub no_new_privs: bool,
@@ -29,6 +31,17 @@ pub struct Applied {
     pub seccomp: bool,
     /// rlimits applied (`RLIMIT_FSIZE`, `RLIMIT_NOFILE`, optionally `RLIMIT_AS`).
     pub rlimits: Vec<String>,
+}
+
+/// Whether a Landlock status of [`Applied::landlock`] confines the executor as ADR-0009 requires:
+/// fully enforced, or enforced with every right of an ABI v3 or v4 kernel (Linux 6.2 to 6.9). Those
+/// know every filesystem right the ruleset asks for but `IoctlDev`, which the ruleset grants anyway
+/// on `/dev`, the only directory of the sandbox holding device nodes.
+pub fn landlock_holds(state: &str) -> bool {
+    matches!(
+        state,
+        "fully_enforced" | "enforced_abi_v3" | "enforced_abi_v4"
+    )
 }
 
 /// Environment variables the sandbox sets on purpose (`sandbox::plan_with`); any other one found

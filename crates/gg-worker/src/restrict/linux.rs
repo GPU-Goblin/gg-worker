@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use landlock::{
-    ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    ABI, Access, AccessFs, LandlockStatus, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
     path_beneath_rules,
 };
 use seccompiler::{
@@ -19,12 +19,13 @@ use super::{
 
 /// Apply Landlock: read-only system paths and bundle, read-write `outputs/` and `/tmp`, read-write
 /// `/dev` (device ioctls need `O_RDWR`; inside the sandbox `/dev` only holds the allowed nodes).
-/// `kernel_cache`: the compiled-kernel cache (ADR-0032), read-write when present.
+/// `kernel_cache`: the compiled-kernel cache (ADR-0032), read-write when present. Returns the
+/// status as [`Applied::landlock`] names it, and whether `no_new_privs` is set.
 pub fn apply_landlock(
     bundle: &Path,
     kernel_cache: Option<&Path>,
     session: bool,
-) -> Result<(RulesetStatus, bool), String> {
+) -> Result<(String, bool), String> {
     let abi = ABI::V5;
     let libtorch = Path::new(crate::bundle::SANDBOX_LIBTORCH_DIR);
     let ro: Vec<&Path> = ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc", "/sys"]
@@ -64,7 +65,29 @@ pub fn apply_landlock(
         .map_err(|e| e.to_string())?
         .restrict_self()
         .map_err(|e| e.to_string())?;
-    Ok((status.ruleset, status.no_new_privs))
+    let effective = match status.landlock {
+        LandlockStatus::Available { effective_abi, .. } => Some(effective_abi),
+        _ => None,
+    };
+    Ok((
+        landlock_state(status.ruleset, effective),
+        status.no_new_privs,
+    ))
+}
+
+/// The name of a Landlock status. The ruleset asks for the rights of ABI v5; on a v3 or v4 kernel
+/// (Linux 6.2 to 6.9) it is partially enforced only for lack of `IoctlDev`, and is named after that
+/// ABI ([`super::landlock_holds`] accepts it). Older kernels miss rights that matter here
+/// (`Truncate`, `Refer`): plainly partially enforced.
+fn landlock_state(status: RulesetStatus, effective: Option<ABI>) -> String {
+    match (status, effective) {
+        (RulesetStatus::FullyEnforced, _) => "fully_enforced",
+        (RulesetStatus::PartiallyEnforced, Some(ABI::V3)) => "enforced_abi_v3",
+        (RulesetStatus::PartiallyEnforced, Some(ABI::V4)) => "enforced_abi_v4",
+        (RulesetStatus::PartiallyEnforced, _) => "partially_enforced",
+        (RulesetStatus::NotEnforced, _) => "not_enforced",
+    }
+    .to_owned()
 }
 
 /// Syscalls denied outright (EPERM). Socket *operations* stay allowed because `socket()` is limited
@@ -198,15 +221,7 @@ pub fn apply_layers(params: &RestrictParams<'_>, layers: Layers) -> Result<Appli
         Vec::new()
     };
     let (landlock, no_new_privs) = if layers.landlock {
-        let (status, nnp) = apply_landlock(params.bundle, params.kernel_cache, params.session)?;
-        (
-            match status {
-                RulesetStatus::FullyEnforced => "fully_enforced".to_owned(),
-                RulesetStatus::PartiallyEnforced => "partially_enforced".to_owned(),
-                RulesetStatus::NotEnforced => "not_enforced".to_owned(),
-            },
-            nnp,
-        )
+        apply_landlock(params.bundle, params.kernel_cache, params.session)?
     } else {
         ("skipped".to_owned(), false)
     };
@@ -400,7 +415,7 @@ pub fn probe(
     if let Some(a) = &applied {
         checks.push(check(
             "landlock_enforced",
-            a.landlock == "fully_enforced" && a.no_new_privs,
+            super::landlock_holds(&a.landlock) && a.no_new_privs,
             format!("{} (no_new_privs {})", a.landlock, a.no_new_privs),
         ));
     } else {
@@ -416,5 +431,77 @@ pub fn probe(
         applied,
         apply_error,
         checks,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ground for accepting ABI v3 and v4 kernels: their filesystem rights are those of v5 but
+    /// `IoctlDev`, which the ruleset grants on `/dev` anyway.
+    #[test]
+    fn landlock_v3_and_v4_lack_only_ioctl_dev() {
+        let mut v5 = AccessFs::from_all(ABI::V5);
+        v5.remove(AccessFs::IoctlDev);
+        assert_eq!(v5, AccessFs::from_all(ABI::V4));
+        assert_eq!(v5, AccessFs::from_all(ABI::V3));
+        assert_ne!(v5, AccessFs::from_all(ABI::V2), "v2 lacks Truncate");
+    }
+
+    #[test]
+    fn landlock_states_and_what_they_allow() {
+        let cases = [
+            (
+                RulesetStatus::FullyEnforced,
+                Some(ABI::V5),
+                "fully_enforced",
+                true,
+            ),
+            (
+                RulesetStatus::FullyEnforced,
+                Some(ABI::V8),
+                "fully_enforced",
+                true,
+            ),
+            (
+                RulesetStatus::PartiallyEnforced,
+                Some(ABI::V4),
+                "enforced_abi_v4",
+                true,
+            ),
+            (
+                RulesetStatus::PartiallyEnforced,
+                Some(ABI::V3),
+                "enforced_abi_v3",
+                true,
+            ),
+            (
+                RulesetStatus::PartiallyEnforced,
+                Some(ABI::V2),
+                "partially_enforced",
+                false,
+            ),
+            (
+                RulesetStatus::PartiallyEnforced,
+                Some(ABI::V1),
+                "partially_enforced",
+                false,
+            ),
+            (
+                RulesetStatus::PartiallyEnforced,
+                None,
+                "partially_enforced",
+                false,
+            ),
+            (RulesetStatus::NotEnforced, None, "not_enforced", false),
+        ];
+        for (status, abi, name, holds) in cases {
+            let state = landlock_state(status, abi);
+            assert_eq!(state, name);
+            assert_eq!(super::super::landlock_holds(&state), holds, "{state}");
+        }
+        assert!(!super::super::landlock_holds("skipped"));
+        assert!(!super::super::landlock_holds("error: no landlock"));
     }
 }

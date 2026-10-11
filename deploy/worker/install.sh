@@ -19,7 +19,9 @@
 #   8. when the release has it, installs the GPU Goblin application (gg-desk): in the terminal
 #      (`gg-desk status`, `gg-desk console`) always, with a menu entry started with the session on
 #      a desktop (unless --no-desktop).
-# The only use of sudo is to install bubblewrap from your distribution, and only if you say yes.
+# sudo is used for two things only, each if you say yes: installing bubblewrap from your
+# distribution, and, where AppArmor restricts user namespaces without a profile for bubblewrap
+# (Ubuntu 24.04), installing that profile (/etc/apparmor.d/gpu-goblin-bwrap).
 #
 # The release key used the first time is pinned in ~/.config/gpu-goblin/allowed_signers; a later run
 # with another key stops. Update and rollback: INSTALL.md (verify the new install.sh with the pinned
@@ -76,7 +78,7 @@ Options:
   --no-start              install and check, but do not enable or start the service
   --no-desktop            no menu entry nor start with the session (servers: gg-desk still works
                           in the terminal)
-  --yes                   answer yes to questions (bubblewrap installation)
+  --yes                   answer yes to questions (bubblewrap installation, its AppArmor profile)
 EOF
 }
 
@@ -173,6 +175,49 @@ if ! command -v bwrap >/dev/null; then
 	# shellcheck disable=SC2086
 	sudo $installer || die "bubblewrap installation failed"
 	command -v bwrap >/dev/null || die "bwrap still not found after installation"
+fi
+
+# Ubuntu 23.10 and later grant unprivileged user namespaces only to programs whose AppArmor profile
+# allows them (kernel.apparmor_restrict_unprivileged_userns = 1): without one, bubblewrap cannot
+# build the sandbox. Ubuntu 24.10 and later ship a profile for it; 24.04 does not. The profile below
+# is the one Ubuntu documents for a single program: bwrap may create user namespaces, as it may on
+# systems without the restriction; nothing else changes.
+bwrap_works() { bwrap --ro-bind / / --unshare-all --die-with-parent true 2>/dev/null; }
+aa_profile=/etc/apparmor.d/gpu-goblin-bwrap
+if ! bwrap_works; then
+	bwrap_path="$(readlink -f "$(command -v bwrap)")"
+	restricted="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
+	[[ "$restricted" == 1 && -d /etc/apparmor.d ]] ||
+		die "bubblewrap cannot create its sandbox here: unprivileged user namespaces are disabled (sysctl kernel.unprivileged_userns_clone or user.max_user_namespaces)"
+	others="$(grep -lsE "^[[:space:]]*profile[[:space:]]+[^[:space:]]+[[:space:]]+$bwrap_path([[:space:]]|$)" /etc/apparmor.d/* | grep -vx "$aa_profile" || true)"
+	[[ -z "$others" ]] ||
+		die "bubblewrap cannot create its sandbox although AppArmor has a profile for it ($others): check 'sudo aa-status' and the kernel log (journalctl -k | grep -i apparmor)"
+	echo "AppArmor restricts unprivileged user namespaces on this system and has no profile for bubblewrap:"
+	echo "the sandbox cannot be built. The fix is one small profile, $aa_profile, that lets $bwrap_path"
+	echo "create user namespaces (remove it with: sudo apparmor_parser -R $aa_profile && sudo rm $aa_profile)."
+	answer=no
+	if [[ "$assume_yes" == yes ]]; then
+		answer=yes
+	elif [[ -t 0 ]]; then
+		read -r -p "Install this AppArmor profile now (sudo)? [y/N] " reply
+		[[ "$reply" =~ ^[yY] ]] && answer=yes
+	fi
+	[[ "$answer" == yes ]] || die "the sandbox needs this AppArmor profile; run this installer again and answer yes, or see INSTALL.md"
+	aa_tmp="$(mktemp)"
+	printf '%s\n' \
+		"# GPU Goblin (install.sh): lets bubblewrap create the user namespaces of its sandbox, which" \
+		"# AppArmor restricts on this system. Remove: sudo apparmor_parser -R $aa_profile && sudo rm $aa_profile" \
+		'abi <abi/4.0>,' \
+		'include <tunables/global>' \
+		"profile gpu-goblin-bwrap $bwrap_path flags=(unconfined) {" \
+		'  userns,' \
+		'  include if exists <local/gpu-goblin-bwrap>' \
+		'}' >"$aa_tmp"
+	sudo install -m 0644 -o root -g root "$aa_tmp" "$aa_profile" || die "cannot write $aa_profile"
+	rm -f "$aa_tmp"
+	sudo apparmor_parser -r "$aa_profile" || die "AppArmor refused $aa_profile"
+	bwrap_works || die "bubblewrap still cannot create its sandbox with $aa_profile loaded"
+	echo "AppArmor profile installed: bubblewrap can build the sandbox."
 fi
 
 work="$(mktemp -d)"

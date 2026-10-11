@@ -22,15 +22,19 @@ install one package (bubblewrap) if it is missing.
 
 ## Requirements
 
-- Linux x86_64 with systemd (Debian 12, Ubuntu 22.04/24.04, Fedora 39+ are known to fit).
-- `curl`, `ssh-keygen` (package `openssh-client`), `sha256sum` (coreutils), `bubblewrap`.
+- Linux x86_64 with systemd and a kernel 6.2 or later (the sandbox needs Landlock ABI v3).
+  Measured: Ubuntu 24.04 server as installed (kernel 6.8, AppArmor restriction on), and Ubuntu
+  26.04 (kernel 7.0) with that restriction turned off. Debian 12's kernel (6.1) is too old:
+  install the one from `bookworm-backports`.
+- `curl`, `ssh-keygen` (package `openssh-client`), `sha256sum` (coreutils), `bubblewrap`; on
+  Ubuntu 24.04, an AppArmor profile for bubblewrap, which the installer offers (below).
 - For the GPU build: a Vulkan driver for your card (`vulkaninfo` lists it).
 - About 300 MB for the programs, plus what you allow for tasks (20 GiB by default).
 
 ## Your account
 
-Create your contributor account at <https://grid.gpugoblin.com/portal/contribute> (the site
-<https://gpugoblin.com> links to it): enter your e-mail address, type the code you receive, then
+Create your account at <https://gpugoblin.com/account/>: enter your e-mail address, type the code
+you receive, then
 **create an enrollment code** (`gge_…`). It is shown once; it attaches your machines to your
 account, so keep it private. Your account page then lists your machines and the tasks they
 computed.
@@ -148,6 +152,29 @@ is checked against the same signed digest.
 The engine computes in strict float32: the sandbox sets `NVIDIA_TF32_OVERRIDE=0` for the executor.
 Building it yourself: `cargo build --release --bin gg-executor --features gg-worker/cuda` with
 `LIBTORCH` pointing to the unpacked archive.
+
+## AppArmor and bubblewrap (Ubuntu 24.04)
+
+Ubuntu 23.10 and later let a program create unprivileged user namespaces only when an AppArmor
+profile allows it (`sysctl kernel.apparmor_restrict_unprivileged_userns` is 1). Ubuntu 24.10 and
+later ship a profile for bubblewrap; 24.04 does not, and bubblewrap then fails with
+`loopback: Failed RTM_NEWADDR: Operation not permitted`. The installer detects it and offers one
+small profile, the one Ubuntu documents for a single program:
+
+```
+# /etc/apparmor.d/gpu-goblin-bwrap
+abi <abi/4.0>,
+include <tunables/global>
+profile gpu-goblin-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/gpu-goblin-bwrap>
+}
+```
+
+It lets `bwrap` create user namespaces, as it may on systems without this restriction; nothing
+else changes. It is installed only if you answer yes (or pass `--yes`), with `sudo`, and never
+when your distribution already has a profile for bubblewrap. To remove it:
+`sudo apparmor_parser -R /etc/apparmor.d/gpu-goblin-bwrap && sudo rm /etc/apparmor.d/gpu-goblin-bwrap`.
 
 ## cgroup delegation (resource limits)
 
