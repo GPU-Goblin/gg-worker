@@ -34,7 +34,7 @@ DEFAULT_SERVER_URL="https://grid.gpugoblin.com"
 DEFAULT_NETWORK="gg-beta-1"
 # The release public key, as printed by `gg release keygen` / `gg release ssh-key <hex>`. Compare it
 # with the one the operator gave you through another channel (in person, signed mail, lab page).
-RELEASE_ALLOWED_SIGNERS='release@gpu-goblin namespaces="gg-release" REPLACE_WITH_THE_RELEASE_PUBLIC_KEY'
+RELEASE_ALLOWED_SIGNERS='release@gpu-goblin namespaces="gg-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEVp1adRtKn6v2iU8hG/jSMsIALjae/LkpY3AODuih9v'
 # ------------------------------------------------------------------------------------------------
 
 PRINCIPAL="release@gpu-goblin"
